@@ -31,6 +31,15 @@ st.title("🚌 Servis Rota Optimizasyonu")
 st.caption("Excel'i yükleyin; sistem kapasiteyi dikkate alarak rota sayısını, durak sırasını ve dolulukları oluştursun.")
 
 
+FACTORY_ADDRESS = (
+    "VitrA Karo Sanayi ve Ticaret A.Ş., 4 Eylül Mah. "
+    "Osman Rusçuk Cd. No:13, Bozüyük, Bilecik"
+)
+# Kampüs merkezi için yaklaşık koordinat. Servis kapısı biliniyorsa arayüzden değiştirilebilir.
+FACTORY_LAT = 39.903830
+FACTORY_LON = 30.084850
+
+
 ALIASES = {
     "id": ["calisan_id", "çalışan_id", "personel_sicil", "sicil", "id"],
     "name": ["ad_soyad", "ad soyad", "çalışanın_adı_soyad", "calisan_adi", "çalışan adı"],
@@ -173,10 +182,17 @@ def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
 
 with st.sidebar:
     st.header("Planlama ayarları")
-    mode_label = st.radio("Rota sayısı", ["Sabit 3 servis", "Otomatik (minimum)"])
-    capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=35, step=1)
-    direction_label = st.radio("Sefer yönü", ["Sabah: çalışan → fabrika", "Akşam: fabrika → çalışan"])
-    st.caption("Rotalar gerçek yol ağına göre otomatik hesaplanır.")
+    mode_label = st.radio(
+        "Rota sayısı",
+        ["Sabit 3 servis", "Otomatik (minimum)"],
+        index=1,
+    )
+    capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=45, step=1)
+    direction_label = st.radio(
+        "Sefer yönü",
+        ["Sabah (08.00 varış): çalışan → fabrika", "Akşam (17.30 çıkış): fabrika → çalışan"],
+    )
+    st.caption("Mesai: 08.00–17.30 · Rotalar gerçek yol ağına göre hesaplanır.")
 
 uploaded = st.file_uploader("Çalışan adres Excel'ini yükleyin", type=["xlsx", "xls"])
 
@@ -219,10 +235,13 @@ if not factory_rows.empty and factory_rows[["Enlem", "Boylam"]].notna().all(axis
     st.success(f"Excel'den alındı: {factory_address} ({factory_lat:.5f}, {factory_lon:.5f})")
 else:
     f1, f2, f3 = st.columns([2, 1, 1])
-    factory_address = f1.text_input("Fabrika adresi", value="")
-    factory_lat = f2.number_input("Fabrika enlem", value=39.776000, format="%.6f")
-    factory_lon = f3.number_input("Fabrika boylam", value=30.520000, format="%.6f")
-    st.caption("Yukarıdaki örnek koordinatları gerçek fabrikanın koordinatlarıyla değiştirin.")
+    factory_address = f1.text_input("Fabrika adresi", value=FACTORY_ADDRESS)
+    factory_lat = f2.number_input("Fabrika enlem", value=FACTORY_LAT, format="%.6f")
+    factory_lon = f3.number_input("Fabrika boylam", value=FACTORY_LON, format="%.6f")
+    st.caption(
+        "Koordinatlar VitrA Bozüyük kampüs merkezini yaklaşık gösterir. "
+        "Servis araçlarının kullandığı kapının koordinatı biliniyorsa onunla değiştirin."
+    )
 
 missing_mask = employees[["Enlem", "Boylam"]].isna().any(axis=1)
 if missing_mask.any():

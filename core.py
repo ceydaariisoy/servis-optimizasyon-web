@@ -67,14 +67,23 @@ def build_estimated_matrices(
     return durations, distances
 
 
-def fetch_osrm_table(
-    coordinates: Sequence[tuple[float, float]], timeout: int = 25
+def _fetch_osrm_block(
+    coordinates: Sequence[tuple[float, float]],
+    source_indices: Sequence[int],
+    destination_indices: Sequence[int],
+    timeout: int,
 ) -> tuple[list[list[float]], list[list[float]]]:
-    """OSRM genel sunucusundan sürüş süresi ve yol mesafesi matrisi alır."""
-    if len(coordinates) > 90:
-        raise ValueError("OSRM genel sunucusu için tek seferde en fazla 90 nokta kullanılıyor.")
-    coord_text = ";".join(f"{lon:.7f},{lat:.7f}" for lat, lon in coordinates)
-    url = f"https://router.project-osrm.org/table/v1/driving/{coord_text}?annotations=duration,distance"
+    """Büyük matrisin tek bir kaynak-hedef bloğunu OSRM'den alır."""
+    used_indices = list(dict.fromkeys([*source_indices, *destination_indices]))
+    local_index = {global_index: index for index, global_index in enumerate(used_indices)}
+    selected_coordinates = [coordinates[index] for index in used_indices]
+    coord_text = ";".join(f"{lon:.7f},{lat:.7f}" for lat, lon in selected_coordinates)
+    sources = ";".join(str(local_index[index]) for index in source_indices)
+    destinations = ";".join(str(local_index[index]) for index in destination_indices)
+    url = (
+        f"https://router.project-osrm.org/table/v1/driving/{coord_text}"
+        f"?annotations=duration,distance&sources={sources}&destinations={destinations}"
+    )
     request = Request(url, headers={"User-Agent": "Eskisehir-Servis-Optimizasyonu/1.0"})
     with urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -82,8 +91,43 @@ def fetch_osrm_table(
         raise RuntimeError(payload.get("message", "OSRM matrisi alınamadı."))
     durations = payload.get("durations")
     distances = payload.get("distances")
-    if not durations or not distances or any(value is None for row in durations for value in row):
+    if (
+        not durations
+        or not distances
+        or any(value is None for row in durations for value in row)
+        or any(value is None for row in distances for value in row)
+    ):
         raise RuntimeError("Bazı noktalar için yol süresi bulunamadı.")
+    return durations, distances
+
+
+def fetch_osrm_table(
+    coordinates: Sequence[tuple[float, float]], timeout: int = 25, block_size: int = 35
+) -> tuple[list[list[float]], list[list[float]]]:
+    """OSRM'den sürüş matrisi alır; 90'dan fazla noktayı güvenli bloklara böler."""
+    point_count = len(coordinates)
+    if point_count <= 90:
+        indices = list(range(point_count))
+        return _fetch_osrm_block(coordinates, indices, indices, timeout)
+
+    if block_size < 1 or block_size * 2 > 90:
+        raise ValueError("Blok büyüklüğü 1 ile 45 arasında olmalıdır.")
+
+    durations = [[0.0] * point_count for _ in range(point_count)]
+    distances = [[0.0] * point_count for _ in range(point_count)]
+    blocks = [
+        list(range(start, min(start + block_size, point_count)))
+        for start in range(0, point_count, block_size)
+    ]
+    for source_indices in blocks:
+        for destination_indices in blocks:
+            duration_block, distance_block = _fetch_osrm_block(
+                coordinates, source_indices, destination_indices, timeout
+            )
+            for source_position, source_index in enumerate(source_indices):
+                for destination_position, destination_index in enumerate(destination_indices):
+                    durations[source_index][destination_index] = duration_block[source_position][destination_position]
+                    distances[source_index][destination_index] = distance_block[source_position][destination_position]
     return durations, distances
 
 
@@ -236,7 +280,7 @@ def plan_routes(
     mode: str = "auto",
     fixed_vehicle_count: int = 3,
     direction: str = "morning",
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 0,
     max_route_minutes: float = 0,
     use_road_network: bool = True,
     average_speed_kmh: float = 32.0,
@@ -310,4 +354,3 @@ def plan_routes(
         distance_matrix=distance_matrix,
         warnings=warnings,
     )
-

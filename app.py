@@ -9,7 +9,10 @@ import pydeck as pdk
 import streamlit as st
 
 from core import (
+    assign_common_stops_to_routes,
+    cluster_common_stops,
     fetch_osrm_geometry,
+    order_route_points,
     plan_routes,
 )
 
@@ -32,7 +35,7 @@ st.markdown(
 st.title("🚌 Servis Rota Optimizasyonu")
 st.caption(
     "Enlem ve boylam içeren Excel'i yükleyin; sistem minimum servis sayısını, "
-    "durak sırasını ve güzergâhları oluştursun."
+    "ortak buluşma duraklarını, durak sırasını ve güzergâhları oluştursun."
 )
 
 
@@ -136,41 +139,132 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out
 
 
-def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
-    summary_rows = []
-    stop_rows = []
-    for route in result.routes:
-        summary_rows.append(
-            {
-                "Rota": f"Rota {route.vehicle_no}",
-                "Yolcu": route.occupancy,
-                "Kapasite": capacity,
-                "Doluluk_Orani": route.occupancy / capacity,
-                "Mesafe_km": round(route.distance_km, 1),
-                "Surus_Suresi_dk": round(route.drive_minutes),
+def build_shared_routes(result, employees: pd.DataFrame, max_walk_m: int, direction: str):
+    """Önce ortak durakları kurar, sonra durakları kapasite sınırlı araçlara dağıtır."""
+    employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
+    all_stops = cluster_common_stops(employee_coordinates, max_walk_m=max_walk_m)
+    coordinates = [
+        (math.nan, math.nan),
+        *employee_coordinates,
+    ]
+    # Fabrika koordinatı matrisin 0. satırında zaten bulunduğu için yalnızca açı hesabında
+    # gerçek depo değerine ihtiyaç var; matristen bağımsız koordinat listesini eşitliyoruz.
+    coordinates[0] = st.session_state["result_factory"][:2]
+    allocated_routes = assign_common_stops_to_routes(
+        all_stops,
+        coordinates,
+        result.vehicle_count,
+        st.session_state["result_capacity"],
+        result.duration_matrix,
+        direction,
+    )
+    shared_routes = []
+    for vehicle_no, allocated_stops in enumerate(allocated_routes, start=1):
+        stops = []
+        for stop in allocated_stops:
+            anchor_employee_index = stop.anchor_index
+            members = list(stop.member_indices)
+            walk_by_employee = {
+                employee_index: distance
+                for employee_index, distance in zip(stop.member_indices, stop.walking_distances_m)
             }
-        )
-        for order, matrix_index in enumerate(route.employee_indices, start=1):
-            row = employees.iloc[matrix_index - 1]
-            stop_rows.append(
+            stops.append(
                 {
-                    "Rota": f"Rota {route.vehicle_no}",
-                    "Durak_Sirasi": order,
-                    "Calisan_ID": row["Calisan_ID"],
-                    "Ad_Soyad": row["Ad_Soyad"],
-                    "Adres": row["Adres"],
-                    "Enlem": row["Enlem"],
-                    "Boylam": row["Boylam"],
+                    "anchor_employee_index": anchor_employee_index,
+                    "anchor_matrix_index": anchor_employee_index + 1,
+                    "member_indices": members,
+                    "walk_by_employee": walk_by_employee,
+                    "passenger_count": len(members),
+                    "max_walk_m": stop.max_walk_m,
+                    "average_walk_m": stop.average_walk_m,
                 }
             )
+
+        ordered_stops = stops
+        ordered_matrix_indices = [stop["anchor_matrix_index"] for stop in ordered_stops]
+        path_indices = [*ordered_matrix_indices, 0] if direction == "morning" else [0, *ordered_matrix_indices]
+        drive_seconds = sum(result.duration_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
+        distance_meters = sum(result.distance_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
+        all_walks = [
+            distance
+            for stop in ordered_stops
+            for distance in stop["walk_by_employee"].values()
+        ]
+        shared_routes.append(
+            {
+                "vehicle_no": vehicle_no,
+                "occupancy": sum(stop["passenger_count"] for stop in ordered_stops),
+                "stops": ordered_stops,
+                "path_indices": path_indices,
+                "distance_km": distance_meters / 1000,
+                "drive_minutes": drive_seconds / 60,
+                "average_walk_m": sum(all_walks) / len(all_walks) if all_walks else 0,
+                "max_walk_m": max(all_walks, default=0),
+            }
+        )
+    return shared_routes
+
+
+def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> bytes:
+    summary_rows = []
+    stop_rows = []
+    assignment_rows = []
+    for route in shared_routes:
+        summary_rows.append(
+            {
+                "Rota": f"Rota {route['vehicle_no']}",
+                "Yolcu": route["occupancy"],
+                "Kapasite": capacity,
+                "Doluluk_Orani": route["occupancy"] / capacity,
+                "Ortak_Durak_Sayisi": len(route["stops"]),
+                "Mesafe_km": round(route["distance_km"], 1),
+                "Surus_Suresi_dk": round(route["drive_minutes"]),
+                "Ort_Yurume_m": round(route["average_walk_m"]),
+                "En_Uzak_Yurume_m": round(route["max_walk_m"]),
+            }
+        )
+        for order, stop in enumerate(route["stops"], start=1):
+            anchor = employees.iloc[stop["anchor_employee_index"]]
+            stop_rows.append(
+                {
+                    "Rota": f"Rota {route['vehicle_no']}",
+                    "Durak_Sirasi": order,
+                    "Durak_Adresi": anchor["Adres"],
+                    "Yolcu_Sayisi": stop["passenger_count"],
+                    "Enlem": anchor["Enlem"],
+                    "Boylam": anchor["Boylam"],
+                    "En_Uzak_Yurume_m": round(stop["max_walk_m"]),
+                }
+            )
+            for employee_index in stop["member_indices"]:
+                row = employees.iloc[employee_index]
+                assignment_rows.append(
+                    {
+                        "Rota": f"Rota {route['vehicle_no']}",
+                        "Durak_Sirasi": order,
+                        "Calisan_ID": row["Calisan_ID"],
+                        "Ad_Soyad": row["Ad_Soyad"],
+                        "Ev_Adresi": row["Adres"],
+                        "Durak_Adresi": anchor["Adres"],
+                        "Yurume_Mesafesi_m": round(stop["walk_by_employee"][employee_index]),
+                        "Durak_Enlem": anchor["Enlem"],
+                        "Durak_Boylam": anchor["Boylam"],
+                    }
+                )
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Rota_Ozeti", index=False)
-        pd.DataFrame(stop_rows).to_excel(writer, sheet_name="Duraklar", index=False)
+        pd.DataFrame(stop_rows).to_excel(writer, sheet_name="Ortak_Duraklar", index=False)
+        pd.DataFrame(assignment_rows).to_excel(writer, sheet_name="Personel_Durak_Eslesmesi", index=False)
         workbook = writer.book
         header = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
         percent = workbook.add_format({"num_format": "0%"})
-        for sheet_name, frame in (("Rota_Ozeti", pd.DataFrame(summary_rows)), ("Duraklar", pd.DataFrame(stop_rows))):
+        frames = (
+            ("Rota_Ozeti", pd.DataFrame(summary_rows)),
+            ("Ortak_Duraklar", pd.DataFrame(stop_rows)),
+            ("Personel_Durak_Eslesmesi", pd.DataFrame(assignment_rows)),
+        )
+        for sheet_name, frame in frames:
             sheet = writer.sheets[sheet_name]
             for col, name in enumerate(frame.columns):
                 sheet.write(0, col, name, header)
@@ -179,7 +273,7 @@ def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
         writer.sheets["Rota_Ozeti"].set_column("D:D", 15, percent)
-        writer.sheets["Rota_Ozeti"].set_column("E:F", 18)
+        writer.sheets["Rota_Ozeti"].set_column("E:I", 18)
     return output.getvalue()
 
 
@@ -191,6 +285,14 @@ with st.sidebar:
         index=1,
     )
     capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=45, step=1)
+    max_walk_m = st.slider(
+        "Azami yürüme mesafesi (metre)",
+        min_value=200,
+        max_value=1200,
+        value=500,
+        step=50,
+        help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
+    )
     direction_label = st.radio(
         "Sefer yönü",
         ["Sabah (08.00 varış): çalışan → fabrika", "Akşam (17.30 çıkış): fabrika → çalışan"],
@@ -202,7 +304,7 @@ with st.sidebar:
             "Koordinatların yol hesabı için açık OSRM servisine gönderilmesini onaylıyorum. "
             "İsim, sicil ve adres gönderilmez."
         )
-    st.caption("Mesai: 08.00–17.30 · Durak başına bekleme süresi eklenmez.")
+    st.caption("Mesai: 08.00–17.30 · Yakın çalışanlar ortak durakta buluşur · Bekleme süresi eklenmez.")
 
 uploaded = st.file_uploader("Koordinatlı çalışan Excel'ini yükleyin", type=["xlsx", "xls"])
 
@@ -294,6 +396,7 @@ if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready or
             st.session_state["result_factory"] = (factory_lat, factory_lon, factory_address)
             st.session_state["result_direction"] = direction_label
             st.session_state["result_capacity"] = int(capacity)
+            st.session_state["result_max_walk_m"] = int(max_walk_m)
         except Exception as exc:
             st.error(str(exc))
 
@@ -307,17 +410,26 @@ employees = st.session_state["result_employees"]
 factory_lat, factory_lon, factory_address = st.session_state["result_factory"]
 result_direction = st.session_state["result_direction"]
 result_capacity = st.session_state["result_capacity"]
+result_max_walk_m = st.session_state.get("result_max_walk_m", 500)
+direction = "morning" if result_direction.startswith("Sabah") else "evening"
+shared_routes = build_shared_routes(result, employees, result_max_walk_m, direction)
 
 st.subheader("3. Optimizasyon sonucu")
 for warning in result.warnings:
     st.warning(warning)
 
-nonempty_routes = [route for route in result.routes if route.occupancy]
-avg_fill = sum(route.occupancy for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
-r1, r2, r3 = st.columns(3)
+nonempty_routes = [route for route in shared_routes if route["occupancy"]]
+avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
+total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
+r1, r2, r3, r4 = st.columns(4)
 r1.metric("Önerilen servis sayısı", result.vehicle_count)
 r2.metric("Toplam çalışan", len(employees))
-r3.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
+r3.metric("Ortak durak sayısı", total_stop_count)
+r4.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
+st.caption(
+    f"Ortak duraklar {result_max_walk_m} m azami kuş uçuşu yürüme sınırına göre önerildi. "
+    "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
+)
 
 palette = [
     [40, 90, 132], [213, 94, 0], [0, 140, 120], [163, 75, 148],
@@ -336,28 +448,30 @@ point_data = [
 ]
 
 for route in nonempty_routes:
-    color = palette[(route.vehicle_no - 1) % len(palette)]
+    color = palette[(route["vehicle_no"] - 1) % len(palette)]
     ordered_coordinates = []
-    labels = []
+    stop_by_matrix_index = {stop["anchor_matrix_index"]: stop for stop in route["stops"]}
     stop_number_by_index = {
-        matrix_index: order
-        for order, matrix_index in enumerate(route.employee_indices, start=1)
+        stop["anchor_matrix_index"]: order for order, stop in enumerate(route["stops"], start=1)
     }
-    for matrix_index in route.path_indices:
+    for matrix_index in route["path_indices"]:
         if matrix_index == 0:
             ordered_coordinates.append((factory_lat, factory_lon))
-            labels.append("Fabrika")
         else:
             row = employees.iloc[matrix_index - 1]
             ordered_coordinates.append((float(row["Enlem"]), float(row["Boylam"])))
-            labels.append(str(row["Adres"] or row["Ad_Soyad"] or row["Calisan_ID"]))
+            stop = stop_by_matrix_index[matrix_index]
+            stop_label = str(row["Adres"] or f"Ortak Durak {stop_number_by_index[matrix_index]}")
             point_data.append(
                 {
                     "lon": float(row["Boylam"]), "lat": float(row["Enlem"]),
-                    "label": f"Rota {route.vehicle_no} · Durak {stop_number_by_index[matrix_index]}: {labels[-1]}",
+                    "label": (
+                        f"Rota {route['vehicle_no']} · Ortak Durak {stop_number_by_index[matrix_index]} · "
+                        f"{stop['passenger_count']} yolcu · {stop_label}"
+                    ),
                     "stop_no": str(stop_number_by_index[matrix_index]),
                     "color": color,
-                    "radius": 95,
+                    "radius": 95 + stop["passenger_count"] * 10,
                 }
             )
     try:
@@ -366,7 +480,7 @@ for route in nonempty_routes:
         geometry = []
     if not geometry:
         geometry = [[lon, lat] for lat, lon in ordered_coordinates]
-    path_data.append({"path": geometry, "color": color, "route": f"Rota {route.vehicle_no}"})
+    path_data.append({"path": geometry, "color": color, "route": f"Rota {route['vehicle_no']}"})
 
 layers = [
     pdk.Layer("PathLayer", path_data, get_path="path", get_color="color", get_width=6, width_min_pixels=3, pickable=True),
@@ -404,29 +518,35 @@ st.pydeck_chart(deck, use_container_width=True)
 
 for route in nonempty_routes:
     st.markdown(
-        f"""<div class="route-card"><b>Rota {route.vehicle_no}</b> · {route.occupancy}/{result_capacity} yolcu ·
-        {route.distance_km:.1f} km · {route.drive_minutes:.0f} dk</div>""",
+        f"""<div class="route-card"><b>Rota {route['vehicle_no']}</b> · {route['occupancy']}/{result_capacity} yolcu ·
+        {len(route['stops'])} ortak durak · {route['distance_km']:.1f} km · {route['drive_minutes']:.0f} dk ·
+        ort. {route['average_walk_m']:.0f} m yürüme</div>""",
         unsafe_allow_html=True,
     )
     stop_rows = []
     if not result_direction.startswith("Sabah"):
         stop_rows.append({"Durak": "Başlangıç", "Sicil": "-", "Ad Soyad": "Fabrika", "Adres": factory_address})
-    for order, matrix_index in enumerate(route.employee_indices, start=1):
-        row = employees.iloc[matrix_index - 1]
+    for order, stop in enumerate(route["stops"], start=1):
+        row = employees.iloc[stop["anchor_employee_index"]]
+        passenger_names = ", ".join(
+            str(employees.iloc[index]["Ad_Soyad"] or employees.iloc[index]["Calisan_ID"])
+            for index in stop["member_indices"]
+        )
         stop_rows.append(
             {
                 "Durak": order,
-                "Sicil": row["Calisan_ID"],
-                "Ad Soyad": row["Ad_Soyad"],
-                "Adres": row["Adres"],
+                "Yolcu": stop["passenger_count"],
+                "Ortak Durak Adresi": row["Adres"],
+                "En Uzak Yürüme": f"{stop['max_walk_m']:.0f} m",
+                "Bu Durağa Gelecekler": passenger_names,
             }
         )
     if result_direction.startswith("Sabah"):
         stop_rows.append({"Durak": "Varış", "Sicil": "-", "Ad Soyad": "Fabrika", "Adres": factory_address})
-    with st.expander(f"Rota {route.vehicle_no} durak listesini göster"):
+    with st.expander(f"Rota {route['vehicle_no']} ortak duraklarını ve yolcularını göster"):
         st.dataframe(pd.DataFrame(stop_rows), use_container_width=True, hide_index=True)
 
-export_bytes = result_workbook(result, employees, result_capacity)
+export_bytes = result_workbook(shared_routes, employees, result_capacity)
 st.download_button(
     "📥 Rota sonuçlarını Excel olarak indir",
     data=export_bytes,

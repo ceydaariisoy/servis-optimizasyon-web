@@ -47,6 +47,29 @@ class PlanResult:
     warnings: list[str]
 
 
+@dataclass
+class CommonStop:
+    """Bir ortak buluşma noktası ve bu noktaya yürüyecek çalışanlar."""
+
+    anchor_index: int
+    member_indices: list[int]
+    walking_distances_m: list[float]
+
+    @property
+    def passenger_count(self) -> int:
+        return len(self.member_indices)
+
+    @property
+    def max_walk_m(self) -> float:
+        return max(self.walking_distances_m, default=0.0)
+
+    @property
+    def average_walk_m(self) -> float:
+        if not self.walking_distances_m:
+            return 0.0
+        return sum(self.walking_distances_m) / len(self.walking_distances_m)
+
+
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     """İki (enlem, boylam) noktası arasındaki kuş uçuşu mesafeyi döndürür."""
     lat1, lon1 = map(math.radians, a)
@@ -55,6 +78,63 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     dlon = lon2 - lon1
     h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+
+
+def cluster_common_stops(
+    coordinates: Sequence[tuple[float, float]], max_walk_m: float = 500.0
+) -> list[CommonStop]:
+    """Çalışanları azami kuş uçuşu yürüme sınırıyla ortak duraklarda toplar.
+
+    Duraklar rastgele bir ortalama noktaya değil, çalışan koordinatlarından birine
+    yerleştirilir. Böylece önerilen noktanın bina/yol dışına düşmesi engellenir.
+    Her turda henüz atanmamış en fazla çalışanı kapsayan aday seçilir.
+    """
+    if max_walk_m < 0:
+        raise ValueError("Azami yürüme mesafesi negatif olamaz.")
+    if not coordinates:
+        return []
+
+    count = len(coordinates)
+    distances_m = [
+        [haversine_km(coordinates[i], coordinates[j]) * 1000 for j in range(count)]
+        for i in range(count)
+    ]
+    unassigned = set(range(count))
+    stops: list[CommonStop] = []
+
+    while unassigned:
+        # Eşit kapsamada toplam yürüyüşü daha kısa, sonra sıra numarası küçük aday seçilir.
+        candidates: list[tuple[int, float, int, list[int]]] = []
+        for anchor in sorted(unassigned):
+            members = [
+                index
+                for index in sorted(unassigned)
+                if distances_m[anchor][index] <= max_walk_m + 1e-9
+            ]
+            candidates.append((-len(members), sum(distances_m[anchor][i] for i in members), anchor, members))
+        _, _, anchor, members = min(candidates)
+
+        # Aynı grubu kapsayabilen üyeler arasından toplam yürüyüşü en kısa medoid'i seç.
+        feasible_anchors = [
+            candidate
+            for candidate in members
+            if all(distances_m[candidate][member] <= max_walk_m + 1e-9 for member in members)
+        ]
+        if feasible_anchors:
+            anchor = min(
+                feasible_anchors,
+                key=lambda candidate: (
+                    sum(distances_m[candidate][member] for member in members),
+                    candidate,
+                ),
+            )
+
+        members = sorted(members, key=lambda index: (distances_m[anchor][index], index))
+        walking = [distances_m[anchor][index] for index in members]
+        stops.append(CommonStop(anchor, members, walking))
+        unassigned.difference_update(members)
+
+    return stops
 
 
 def build_estimated_matrices(
@@ -257,13 +337,21 @@ def parse_kml_points(file_bytes: bytes, filename: str = "harita.kml") -> list[di
             kml_bytes = archive.read(kml_names[0])
 
     root = ElementTree.fromstring(kml_bytes)
+    placemarks = root.findall(".//{*}Placemark")
     points: list[dict[str, object]] = []
-    for placemark in root.findall(".//{*}Placemark"):
+    for placemark in placemarks:
         coordinate_node = placemark.find(".//{*}Point/{*}coordinates")
-        if coordinate_node is None or not coordinate_node.text:
+        coordinate_text = coordinate_node.text if coordinate_node is not None else None
+        separator = ","
+        if not coordinate_text:
+            # Bazı KML üreticileri standart Point/coordinates yerine gx:coord kullanır.
+            coordinate_node = placemark.find(".//{*}coord")
+            coordinate_text = coordinate_node.text if coordinate_node is not None else None
+            separator = " "
+        if not coordinate_text:
             continue
-        first_coordinate = coordinate_node.text.strip().split()[0]
-        parts = first_coordinate.split(",")
+        first_coordinate = coordinate_text.strip().splitlines()[0].strip()
+        parts = first_coordinate.split(separator)
         if len(parts) < 2:
             continue
         try:
@@ -277,7 +365,18 @@ def parse_kml_points(file_bytes: bytes, filename: str = "harita.kml") -> list[di
         )
         points.append({"name": name, "text": all_text, "lat": lat, "lon": lon})
     if not points:
-        raise ValueError("KML/KMZ dosyasında nokta bulunamadı.")
+        address_count = sum(
+            1
+            for placemark in placemarks
+            if (placemark.find("./{*}address") is not None)
+        )
+        if placemarks and address_count:
+            raise ValueError(
+                f"Dosyada {len(placemarks)} kayıt ve {address_count} adres var, fakat enlem-boylam "
+                "yok. Google My Maps bu haritada konumları KML'ye nokta olarak yazmamış. "
+                "Aşağıdaki koordinatlı Excel yöntemini kullanın."
+            )
+        raise ValueError("KML/KMZ dosyasında koordinatlı nokta bulunamadı.")
     return points
 
 
@@ -331,6 +430,129 @@ def _two_opt(route: list[int], matrix: Sequence[Sequence[float]], direction: str
         if len(best) > 80:
             break
     return best
+
+
+def order_route_points(
+    point_indices: Sequence[int],
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str = "morning",
+) -> list[int]:
+    """Mevcut matris üzerinde ortak durakları servis yönüne göre sıralar."""
+    if direction not in {"morning", "evening"}:
+        raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+    route = _nearest_neighbor(point_indices, duration_matrix, direction)
+    return _two_opt(route, duration_matrix, direction)
+
+
+def _split_ordered_common_stops(
+    stops: Sequence[CommonStop],
+    ordered_stop_indices: Sequence[int],
+    target_loads: Sequence[int],
+) -> list[list[CommonStop]]:
+    """Ortak durakları hedef araç doluluklarına dağıtır; gerekirse sınır durağını böler."""
+    routes: list[list[CommonStop]] = [[] for _ in target_loads]
+    route_index = 0
+    current_load = 0
+    for stop_index in ordered_stop_indices:
+        stop = stops[stop_index]
+        cursor = 0
+        while cursor < stop.passenger_count:
+            while route_index < len(target_loads) and current_load >= target_loads[route_index]:
+                route_index += 1
+                current_load = 0
+            if route_index >= len(target_loads):
+                raise ValueError("Ortak durak yolcuları araçlara sığdırılamadı.")
+            available = target_loads[route_index] - current_load
+            take = min(available, stop.passenger_count - cursor)
+            routes[route_index].append(
+                CommonStop(
+                    anchor_index=stop.anchor_index,
+                    member_indices=stop.member_indices[cursor : cursor + take],
+                    walking_distances_m=stop.walking_distances_m[cursor : cursor + take],
+                )
+            )
+            cursor += take
+            current_load += take
+    return routes
+
+
+def _allocate_unsplit_common_stops(
+    stops: Sequence[CommonStop],
+    ordered_stop_indices: Sequence[int],
+    target_loads: Sequence[int],
+) -> list[list[CommonStop]] | None:
+    """Mümkünse aynı ortak durağın yolcularını farklı araçlara bölmeden yerleştirir."""
+    remaining = list(ordered_stop_indices)
+    routes: list[list[CommonStop]] = []
+    for target in target_loads[:-1]:
+        combinations: dict[int, list[int]] = {0: []}
+        for stop_index in remaining:
+            passenger_count = stops[stop_index].passenger_count
+            for current_load in sorted(list(combinations), reverse=True):
+                new_load = current_load + passenger_count
+                if new_load <= target and new_load not in combinations:
+                    combinations[new_load] = [*combinations[current_load], stop_index]
+        chosen = combinations.get(target)
+        if chosen is None:
+            return None
+        chosen_set = set(chosen)
+        routes.append([stops[index] for index in remaining if index in chosen_set])
+        remaining = [index for index in remaining if index not in chosen_set]
+    routes.append([stops[index] for index in remaining])
+    if [sum(stop.passenger_count for stop in route) for route in routes] != list(target_loads):
+        return None
+    return routes
+
+
+def assign_common_stops_to_routes(
+    stops: Sequence[CommonStop],
+    coordinates: Sequence[tuple[float, float]],
+    vehicle_count: int,
+    capacity: int,
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str = "morning",
+) -> list[list[CommonStop]]:
+    """Ortak durakları coğrafi bütünlük ve araç kapasitesiyle servis rotalarına dağıtır.
+
+    ``coordinates`` dizisinin ilk noktası fabrika, devamı çalışan koordinatlarıdır.
+    ``CommonStop.anchor_index`` ise çalışan dizisindeki sıfır tabanlı konumdur.
+    """
+    employee_count = sum(stop.passenger_count for stop in stops)
+    target_loads = _balanced_sizes(employee_count, vehicle_count, capacity)
+    if not stops:
+        return [[] for _ in range(vehicle_count)]
+
+    depot_lat, depot_lon = coordinates[0]
+    angular_order = sorted(
+        range(len(stops)),
+        key=lambda stop_index: math.atan2(
+            coordinates[stops[stop_index].anchor_index + 1][0] - depot_lat,
+            coordinates[stops[stop_index].anchor_index + 1][1] - depot_lon,
+        ),
+    )
+    step = 1 if len(angular_order) <= 60 else max(1, len(angular_order) // 30)
+    best_routes: list[list[CommonStop]] | None = None
+    best_score = math.inf
+
+    for rotation in range(0, len(angular_order), step):
+        rotated = angular_order[rotation:] + angular_order[:rotation]
+        allocated = _allocate_unsplit_common_stops(stops, rotated, target_loads)
+        if allocated is None:
+            allocated = _split_ordered_common_stops(stops, rotated, target_loads)
+        ordered_routes: list[list[CommonStop]] = []
+        costs = []
+        for route_stops in allocated:
+            stop_by_matrix_index = {stop.anchor_index + 1: stop for stop in route_stops}
+            ordered_indices = order_route_points(list(stop_by_matrix_index), duration_matrix, direction)
+            ordered_route = [stop_by_matrix_index[index] for index in ordered_indices]
+            ordered_routes.append(ordered_route)
+            costs.append(_path_cost(ordered_indices, duration_matrix, direction))
+        score = sum(costs) + ((max(costs) - min(costs)) * 0.10 if costs else 0.0)
+        if score < best_score:
+            best_score = score
+            best_routes = ordered_routes
+
+    return best_routes or [[] for _ in range(vehicle_count)]
 
 
 def _balanced_sizes(employee_count: int, vehicle_count: int, capacity: int) -> list[int]:

@@ -127,7 +127,7 @@ def cached_geocode(address: str, city: str):
     return geocode_address(address, city)
 
 
-def result_workbook(result, employees: pd.DataFrame) -> bytes:
+def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
     summary_rows = []
     stop_rows = []
     for route in result.routes:
@@ -135,10 +135,8 @@ def result_workbook(result, employees: pd.DataFrame) -> bytes:
             {
                 "Rota": f"Rota {route.vehicle_no}",
                 "Yolcu": route.occupancy,
-                "Mesafe_km": round(route.distance_km, 2),
-                "Surus_dk": round(route.drive_minutes, 1),
-                "Toplam_dk": round(route.total_minutes, 1),
-                "Sure_Asimi": "Evet" if route.exceeds_limit else "Hayır",
+                "Kapasite": capacity,
+                "Doluluk_Orani": route.occupancy / capacity,
             }
         )
         for order, matrix_index in enumerate(route.employee_indices, start=1):
@@ -160,7 +158,7 @@ def result_workbook(result, employees: pd.DataFrame) -> bytes:
         pd.DataFrame(stop_rows).to_excel(writer, sheet_name="Duraklar", index=False)
         workbook = writer.book
         header = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
-        number = workbook.add_format({"num_format": "0.0"})
+        percent = workbook.add_format({"num_format": "0%"})
         for sheet_name, frame in (("Rota_Ozeti", pd.DataFrame(summary_rows)), ("Duraklar", pd.DataFrame(stop_rows))):
             sheet = writer.sheets[sheet_name]
             for col, name in enumerate(frame.columns):
@@ -169,7 +167,7 @@ def result_workbook(result, employees: pd.DataFrame) -> bytes:
                 sheet.set_column(col, col, width)
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
-        writer.sheets["Rota_Ozeti"].set_column("C:E", 12, number)
+        writer.sheets["Rota_Ozeti"].set_column("D:D", 15, percent)
     return output.getvalue()
 
 
@@ -178,10 +176,7 @@ with st.sidebar:
     mode_label = st.radio("Rota sayısı", ["Sabit 3 servis", "Otomatik (minimum)"])
     capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=35, step=1)
     direction_label = st.radio("Sefer yönü", ["Sabah: çalışan → fabrika", "Akşam: fabrika → çalışan"])
-    max_minutes = st.number_input("Maksimum rota süresi (0 = sınır yok)", min_value=0, max_value=240, value=0)
-    wait_seconds = st.number_input("Durak başına bekleme (sn)", min_value=0, max_value=300, value=45, step=5)
-    use_road = st.checkbox("Yol ağı sürelerini kullan", value=True)
-    st.caption("Yol servisine ulaşılamazsa sistem yaklaşık mesafeyle çalışmaya devam eder.")
+    st.caption("Rotalar gerçek yol ağına göre otomatik hesaplanır.")
 
 uploaded = st.file_uploader("Çalışan adres Excel'ini yükleyin", type=["xlsx", "xls"])
 
@@ -273,9 +268,9 @@ if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready):
                 mode="fixed" if mode_label.startswith("Sabit") else "auto",
                 fixed_vehicle_count=3,
                 direction="morning" if direction_label.startswith("Sabah") else "evening",
-                wait_seconds_per_stop=int(wait_seconds),
-                max_route_minutes=float(max_minutes),
-                use_road_network=use_road,
+                wait_seconds_per_stop=0,
+                max_route_minutes=0,
+                use_road_network=True,
             )
             st.session_state["result"] = result
             st.session_state["result_employees"] = employees.copy()
@@ -302,11 +297,10 @@ for warning in result.warnings:
 
 nonempty_routes = [route for route in result.routes if route.occupancy]
 avg_fill = sum(route.occupancy for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
-r1, r2, r3, r4 = st.columns(4)
-r1.metric("Planlanan servis", result.vehicle_count)
-r2.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
-r3.metric("En uzun rota", f"{max((r.total_minutes for r in nonempty_routes), default=0):.0f} dk")
-r4.metric("Hesaplama kaynağı", result.matrix_source)
+r1, r2, r3 = st.columns(3)
+r1.metric("Önerilen servis sayısı", result.vehicle_count)
+r2.metric("Toplam çalışan / durak", len(employees))
+r3.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
 
 palette = [
     [40, 90, 132], [213, 94, 0], [0, 140, 120], [163, 75, 148],
@@ -326,11 +320,11 @@ for route in nonempty_routes:
         else:
             row = employees.iloc[matrix_index - 1]
             ordered_coordinates.append((float(row["Enlem"]), float(row["Boylam"])))
-            labels.append(str(row["Ad_Soyad"] or row["Adres"] or row["Calisan_ID"]))
+            labels.append(str(row["Adres"] or row["Ad_Soyad"] or row["Calisan_ID"]))
             point_data.append(
                 {
                     "lon": float(row["Boylam"]), "lat": float(row["Enlem"]),
-                    "label": f"Rota {route.vehicle_no} · {labels[-1]}", "color": color, "radius": 95,
+                    "label": f"Rota {route.vehicle_no} · Durak: {labels[-1]}", "color": color, "radius": 95,
                 }
             )
     try:
@@ -361,20 +355,19 @@ for route in nonempty_routes:
     stop_names = []
     for matrix_index in route.employee_indices:
         row = employees.iloc[matrix_index - 1]
-        stop_names.append(str(row["Ad_Soyad"] or row["Adres"] or row["Calisan_ID"]))
+        stop_names.append(str(row["Adres"] or row["Ad_Soyad"] or row["Calisan_ID"]))
+    numbered_stops = [f"{number}. {name}" for number, name in enumerate(stop_names, start=1)]
     if result_direction.startswith("Sabah"):
-        sequence = " → ".join([*stop_names, "Fabrika"])
+        sequence = " → ".join([*numbered_stops, "Fabrika"])
     else:
-        sequence = " → ".join(["Fabrika", *stop_names])
-    status = " · ⚠️ Süre sınırı aşıldı" if route.exceeds_limit else ""
+        sequence = " → ".join(["Fabrika", *numbered_stops])
     st.markdown(
-        f"""<div class="route-card"><b>Rota {route.vehicle_no}</b> · {route.occupancy}/{result_capacity} yolcu ·
-        {route.distance_km:.1f} km · {route.total_minutes:.0f} dk{status}<br>
-        <span class="muted">{sequence}</span></div>""",
+        f"""<div class="route-card"><b>Rota {route.vehicle_no}</b> · {route.occupancy}/{result_capacity} yolcu<br>
+        <span class="muted"><b>Duraklar:</b> {sequence}</span></div>""",
         unsafe_allow_html=True,
     )
 
-export_bytes = result_workbook(result, employees)
+export_bytes = result_workbook(result, employees, result_capacity)
 st.download_button(
     "📥 Rota sonuçlarını Excel olarak indir",
     data=export_bytes,

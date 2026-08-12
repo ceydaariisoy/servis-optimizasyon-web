@@ -10,12 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import re
 from typing import Iterable, Sequence
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 EARTH_RADIUS_KM = 6371.0088
+ESKISEHIR_CENTER = (39.7767, 30.5206)
+ESKISEHIR_MAX_DISTANCE_KM = 55.0
 
 
 @dataclass
@@ -150,21 +153,94 @@ def fetch_osrm_geometry(
     return payload["routes"][0]["geometry"]["coordinates"]
 
 
-def geocode_address(address: str, city: str = "Eskişehir, Türkiye", timeout: int = 15) -> tuple[float, float] | None:
-    """Nominatim üzerinden API anahtarı olmadan tek bir adresi koordinata çevirir."""
-    query = address.strip()
-    if city and city.casefold() not in query.casefold():
-        query = f"{query}, {city}"
+def clean_address_for_geocoding(address: str, city: str = "Eskişehir, Türkiye") -> str:
+    """Kurumsal Excel'deki adresleri harita servislerinin daha kolay okuyacağı hale getirir."""
+    text = " ".join(str(address).strip().split())
+    replacements = (
+        (r"\bMAH\.?\b", "Mahallesi"),
+        (r"\bMH\.?\b", "Mahallesi"),
+        (r"\bSK\.?\b", "Sokak"),
+        (r"\bSOK\.?\b", "Sokak"),
+        (r"\bCD\.?\b", "Caddesi"),
+        (r"\bCAD\.?\b", "Caddesi"),
+        (r"\bBLV\.?\b", "Bulvarı"),
+        (r"\bBULV\.?\b", "Bulvarı"),
+    )
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Rota için bina konumu yeterlidir; daire, kat ve iç kapı bilgileri aramayı zorlaştırır.
+    text = re.sub(r"\b(?:İÇ\s*KAPI|DAİRE|KAT)\s*(?:NO\s*)?:?\s*[\w/-]+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(\bNO\s*:?\s*\d+[A-ZÇĞİÖŞÜ]?)[/-]\d+", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:[A-ZÇĞİÖŞÜ]\s*(?:VE\s*[A-ZÇĞİÖŞÜ]\s*)?)?BLOK\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[,;]+\s*", ", ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,")
+
+    normalized = text.casefold().replace("ş", "s").replace("i̇", "i")
+    if city and "eskisehir" not in normalized and "eskişehir" not in text.casefold():
+        text = f"{text}, {city}"
+    elif "türkiye" not in text.casefold() and "turkiye" not in normalized:
+        text = f"{text}, Türkiye"
+    return text
+
+
+def _is_in_eskisehir(lat: float, lon: float) -> bool:
+    return haversine_km((lat, lon), ESKISEHIR_CENTER) <= ESKISEHIR_MAX_DISTANCE_KM
+
+
+def _geocode_nominatim(query: str, timeout: int) -> tuple[float, float] | None:
     params = urlencode({"q": query, "format": "jsonv2", "limit": 1, "countrycodes": "tr"})
     request = Request(
         f"https://nominatim.openstreetmap.org/search?{params}",
-        headers={"User-Agent": "Eskisehir-Servis-Optimizasyonu/1.0 (kurumsal-prototip)"},
+        headers={
+            "User-Agent": "Eskisehir-Servis-Optimizasyonu/2.0 (github.com/ceydaariisoy/servis-optimizasyon-web)",
+            "Accept": "application/json",
+        },
     )
     with urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload:
         return None
-    return float(payload[0]["lat"]), float(payload[0]["lon"])
+    point = float(payload[0]["lat"]), float(payload[0]["lon"])
+    return point if _is_in_eskisehir(*point) else None
+
+
+def _geocode_photon(query: str, timeout: int) -> tuple[float, float] | None:
+    params = urlencode(
+        {
+            "q": query,
+            "limit": 1,
+            "lat": ESKISEHIR_CENTER[0],
+            "lon": ESKISEHIR_CENTER[1],
+        }
+    )
+    request = Request(
+        f"https://photon.komoot.io/api/?{params}",
+        headers={"User-Agent": "Eskisehir-Servis-Optimizasyonu/2.0", "Accept": "application/json"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    features = payload.get("features", []) if isinstance(payload, dict) else []
+    if not features:
+        return None
+    lon, lat = features[0]["geometry"]["coordinates"]
+    point = float(lat), float(lon)
+    return point if _is_in_eskisehir(*point) else None
+
+
+def geocode_address(address: str, city: str = "Eskişehir, Türkiye", timeout: int = 15) -> tuple[float, float] | None:
+    """Adresi temizler; Nominatim sonuç vermezse kullanıcı onaylı Photon yedeğine geçer."""
+    query = clean_address_for_geocoding(address, city)
+    try:
+        found = _geocode_nominatim(query, timeout)
+    except Exception:
+        found = None
+    if found:
+        return found
+    try:
+        return _geocode_photon(query, timeout)
+    except Exception:
+        return None
 
 
 def _route_path(employee_indices: Sequence[int], direction: str) -> list[int]:

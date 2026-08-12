@@ -132,7 +132,7 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def cached_geocode(address: str, city: str):
+def cached_geocode(address: str, city: str, geocoder_version: str = "v2"):
     return geocode_address(address, city)
 
 
@@ -177,6 +177,26 @@ def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
         writer.sheets["Rota_Ozeti"].set_column("D:D", 15, percent)
+    return output.getvalue()
+
+
+def coordinate_workbook(employees: pd.DataFrame) -> bytes:
+    """Bir kez bulunan koordinatları sonraki hesaplamalarda kullanılacak Excel'e yazar."""
+    columns = ["Calisan_ID", "Ad_Soyad", "Adres", "Enlem", "Boylam", "Aktif_mi", "Servis_Kullaniyor_mu"]
+    export_frame = employees[columns].copy()
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        export_frame.to_excel(writer, sheet_name="Personel", index=False)
+        sheet = writer.sheets["Personel"]
+        header = writer.book.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
+        coordinate = writer.book.add_format({"num_format": "0.000000"})
+        for col, name in enumerate(export_frame.columns):
+            sheet.write(0, col, name, header)
+            width = min(max(len(name) + 2, *(len(str(v)) + 2 for v in export_frame[name].head(200))), 55)
+            sheet.set_column(col, col, width)
+        sheet.set_column("D:E", 14, coordinate)
+        sheet.freeze_panes(1, 0)
+        sheet.autofilter(0, 0, max(len(export_frame), 1), len(export_frame.columns) - 1)
     return output.getvalue()
 
 
@@ -243,11 +263,18 @@ else:
         "Servis araçlarının kullandığı kapının koordinatı biliniyorsa onunla değiştirin."
     )
 
+if "geocoded_employees" in st.session_state:
+    employees = st.session_state["geocoded_employees"].copy()
+
 missing_mask = employees[["Enlem", "Boylam"]].isna().any(axis=1)
 if missing_mask.any():
     st.warning(f"{missing_mask.sum()} çalışanın koordinatı eksik. Adres sütunundan ücretsiz olarak tamamlayabilirsiniz.")
     city = st.text_input("Adres aramasında eklenecek şehir", value="Eskişehir, Türkiye")
-    if st.button("Eksik koordinatları adresten bul"):
+    geocode_consent = st.checkbox(
+        "Adres metinlerinin koordinat bulmak için OpenStreetMap Nominatim ve gerektiğinde "
+        "Komoot Photon servislerine gönderilmesini onaylıyorum. İsim ve sicil numarası gönderilmez."
+    )
+    if st.button("Eksik koordinatları adresten bul", disabled=not geocode_consent):
         progress = st.progress(0)
         failures = []
         missing_indices = list(employees.index[missing_mask])
@@ -257,7 +284,7 @@ if missing_mask.any():
                 failures.append(str(employees.at[idx, "Calisan_ID"]))
             else:
                 try:
-                    found = cached_geocode(address, city)
+                    found = cached_geocode(address, city, "v2")
                 except Exception:
                     found = None
                 if found:
@@ -268,12 +295,26 @@ if missing_mask.any():
             progress.progress(count / len(missing_indices))
         st.session_state["geocoded_employees"] = employees
         if failures:
-            st.warning("Koordinatı bulunamayan siciller: " + ", ".join(failures))
+            if len(failures) == len(missing_indices):
+                st.error(
+                    "Hiçbir adres bulunamadı. Harita servisleri geçici olarak erişilemiyor olabilir. "
+                    "Biraz sonra yeniden deneyin."
+                )
+            else:
+                st.warning("Koordinatı bulunamayan siciller: " + ", ".join(failures))
         else:
             st.success("Eksik koordinatlar tamamlandı.")
 
-if "geocoded_employees" in st.session_state:
-    employees = st.session_state["geocoded_employees"]
+found_coordinate_count = int(employees[["Enlem", "Boylam"]].notna().all(axis=1).sum())
+if found_coordinate_count:
+    st.download_button(
+        "📥 Koordinatlı personel Excel'ini indir",
+        data=coordinate_workbook(employees),
+        file_name="Eskisehir_Personel_Koordinatli.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Bu dosyayı saklayın. Sonraki rota hesaplamalarında yeniden adres aramadan kullanabilirsiniz.",
+    )
+    st.caption(f"Koordinatı hazır personel: {found_coordinate_count}/{len(employees)}")
 
 ready = not employees.empty and employees[["Enlem", "Boylam"]].notna().all(axis=1).all()
 st.subheader("2. Rotaları oluştur")

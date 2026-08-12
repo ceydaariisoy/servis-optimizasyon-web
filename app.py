@@ -3,8 +3,6 @@ from __future__ import annotations
 from io import BytesIO
 import hashlib
 import math
-import re
-import time
 
 import pandas as pd
 import pydeck as pdk
@@ -12,9 +10,6 @@ import streamlit as st
 
 from core import (
     fetch_osrm_geometry,
-    geocode_address,
-    is_eskisehir_coordinate,
-    parse_kml_points,
     plan_routes,
 )
 
@@ -35,7 +30,10 @@ st.markdown(
 )
 
 st.title("🚌 Servis Rota Optimizasyonu")
-st.caption("Excel'i yükleyin; sistem kapasiteyi dikkate alarak rota sayısını, durak sırasını ve dolulukları oluştursun.")
+st.caption(
+    "Enlem ve boylam içeren Excel'i yükleyin; sistem minimum servis sayısını, "
+    "durak sırasını ve güzergâhları oluştursun."
+)
 
 
 FACTORY_ADDRESS = (
@@ -138,11 +136,6 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
-def cached_geocode(address: str, city: str, geocoder_version: str = "v2"):
-    return geocode_address(address, city)
-
-
 def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
     summary_rows = []
     stop_rows = []
@@ -153,6 +146,8 @@ def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
                 "Yolcu": route.occupancy,
                 "Kapasite": capacity,
                 "Doluluk_Orani": route.occupancy / capacity,
+                "Mesafe_km": round(route.distance_km, 1),
+                "Surus_Suresi_dk": round(route.drive_minutes),
             }
         )
         for order, matrix_index in enumerate(route.employee_indices, start=1):
@@ -184,73 +179,8 @@ def result_workbook(result, employees: pd.DataFrame, capacity: int) -> bytes:
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
         writer.sheets["Rota_Ozeti"].set_column("D:D", 15, percent)
+        writer.sheets["Rota_Ozeti"].set_column("E:F", 18)
     return output.getvalue()
-
-
-def coordinate_workbook(employees: pd.DataFrame) -> bytes:
-    """Bir kez bulunan koordinatları sonraki hesaplamalarda kullanılacak Excel'e yazar."""
-    columns = ["Calisan_ID", "Ad_Soyad", "Adres", "Enlem", "Boylam", "Aktif_mi", "Servis_Kullaniyor_mu"]
-    export_frame = employees[columns].copy()
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        export_frame.to_excel(writer, sheet_name="Personel", index=False)
-        sheet = writer.sheets["Personel"]
-        header = writer.book.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
-        coordinate = writer.book.add_format({"num_format": "0.000000"})
-        for col, name in enumerate(export_frame.columns):
-            sheet.write(0, col, name, header)
-            width = min(max(len(name) + 2, *(len(str(v)) + 2 for v in export_frame[name].head(200))), 55)
-            sheet.set_column(col, col, width)
-        sheet.set_column("D:E", 14, coordinate)
-        sheet.freeze_panes(1, 0)
-        sheet.autofilter(0, 0, max(len(export_frame), 1), len(export_frame.columns) - 1)
-    return output.getvalue()
-
-
-def my_maps_workbook(employees: pd.DataFrame) -> bytes:
-    """Google My Maps'e aktarılacak, isim içermeyen sicil-adres dosyasını üretir."""
-    export_frame = employees[["Calisan_ID", "Adres"]].rename(
-        columns={"Calisan_ID": "Personel Sicil", "Adres": "ADRES"}
-    )
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        export_frame.to_excel(writer, sheet_name="MyMaps", index=False)
-        sheet = writer.sheets["MyMaps"]
-        header = writer.book.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
-        for col, name in enumerate(export_frame.columns):
-            sheet.write(0, col, name, header)
-        sheet.set_column("A:A", 18)
-        sheet.set_column("B:B", 75)
-        sheet.freeze_panes(1, 0)
-    return output.getvalue()
-
-
-def employee_id_key(value: object) -> str:
-    text = str(value).strip()
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    return text
-
-
-def merge_kml_coordinates(employees: pd.DataFrame, points: list[dict[str, object]]):
-    merged = employees.copy()
-    index_by_id = {employee_id_key(value): idx for idx, value in merged["Calisan_ID"].items()}
-    matched_indices: set[int] = set()
-    outside_count = 0
-    for point in points:
-        lat, lon = float(point["lat"]), float(point["lon"])
-        if not is_eskisehir_coordinate(lat, lon):
-            outside_count += 1
-            continue
-        candidates = [employee_id_key(point.get("name", ""))]
-        candidates.extend(re.findall(r"(?<!\d)\d{3,8}(?!\d)", str(point.get("text", ""))))
-        matched_index = next((index_by_id[key] for key in candidates if key in index_by_id), None)
-        if matched_index is None:
-            continue
-        merged.at[matched_index, "Enlem"] = lat
-        merged.at[matched_index, "Boylam"] = lon
-        matched_indices.add(matched_index)
-    return merged, len(matched_indices), outside_count
 
 
 with st.sidebar:
@@ -265,25 +195,39 @@ with st.sidebar:
         "Sefer yönü",
         ["Sabah (08.00 varış): çalışan → fabrika", "Akşam (17.30 çıkış): fabrika → çalışan"],
     )
-    st.caption("Mesai: 08.00–17.30 · Rotalar gerçek yol ağına göre hesaplanır.")
+    use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
+    road_consent = False
+    if use_road_network:
+        road_consent = st.checkbox(
+            "Koordinatların yol hesabı için açık OSRM servisine gönderilmesini onaylıyorum. "
+            "İsim, sicil ve adres gönderilmez."
+        )
+    st.caption("Mesai: 08.00–17.30 · Durak başına bekleme süresi eklenmez.")
 
-uploaded = st.file_uploader("Çalışan adres Excel'ini yükleyin", type=["xlsx", "xls"])
+uploaded = st.file_uploader("Koordinatlı çalışan Excel'ini yükleyin", type=["xlsx", "xls"])
 
 if uploaded is None:
-    st.info("Başlamak için Excel dosyanızı yükleyin. Hazır şablon proje paketinin içindedir.")
+    st.info("Başlamak için `Enlem` ve `Boylam` sütunları dolu olan Excel dosyanızı yükleyin.")
     st.stop()
 
 raw_bytes = uploaded.getvalue()
 file_key = hashlib.sha256(raw_bytes).hexdigest()
 if st.session_state.get("file_key") != file_key:
-    st.session_state["file_key"] = file_key
-    st.session_state["raw_df"] = pd.read_excel(BytesIO(raw_bytes))
-    st.session_state.pop("result", None)
-    st.session_state.pop("geocoded_employees", None)
+    try:
+        st.session_state["raw_df"] = pd.read_excel(BytesIO(raw_bytes))
+        st.session_state["file_key"] = file_key
+        st.session_state.pop("result", None)
+    except Exception as exc:
+        st.error(f"Excel dosyası okunamadı: {exc}")
+        st.stop()
 
 raw_df = st.session_state["raw_df"]
 mapping = get_mapping(raw_df)
 working = standardize(raw_df, mapping)
+
+if mapping["lat"] is None or mapping["lon"] is None:
+    st.error("Excel'de `Enlem` ve `Boylam` sütunları bulunamadı.")
+    st.stop()
 
 valid_people = working[working["Aktif_mi"] & working["Servis_Kullaniyor_mu"]].copy()
 factory_mask = valid_people["Tip"].apply(is_factory)
@@ -294,7 +238,7 @@ st.subheader("1. Veri kontrolü")
 c1, c2, c3 = st.columns(3)
 c1.metric("Aktif servis kullanıcısı", len(employees))
 c2.metric("Eksik çalışan koordinatı", int(employees[["Enlem", "Boylam"]].isna().any(axis=1).sum()))
-c3.metric("Fabrika satırı", "Bulundu" if not factory_rows.empty else "Elle girilecek")
+c3.metric("Minimum servis", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
 
 with st.expander("Yüklenen veriyi göster", expanded=False):
     st.dataframe(working, use_container_width=True, hide_index=True)
@@ -316,95 +260,22 @@ else:
         "Servis araçlarının kullandığı kapının koordinatı biliniyorsa onunla değiştirin."
     )
 
-if "geocoded_employees" in st.session_state:
-    employees = st.session_state["geocoded_employees"].copy()
-
 missing_mask = employees[["Enlem", "Boylam"]].isna().any(axis=1)
 if missing_mask.any():
-    st.warning(f"{missing_mask.sum()} çalışanın koordinatı eksik. Adres sütunundan ücretsiz olarak tamamlayabilirsiniz.")
-    city = st.text_input("Adres aramasında eklenecek şehir", value="Eskişehir, Türkiye")
-    geocode_consent = st.checkbox(
-        "Adres metinlerinin koordinat bulmak için OpenStreetMap Nominatim ve gerektiğinde "
-        "Komoot Photon servislerine gönderilmesini onaylıyorum. İsim ve sicil numarası gönderilmez."
+    missing_rows = ", ".join(str(index + 2) for index in employees.index[missing_mask][:20])
+    st.error(
+        f"{int(missing_mask.sum())} çalışanın Enlem veya Boylam bilgisi eksik. "
+        f"Excel satırlarını tamamlayıp dosyayı yeniden yükleyin: {missing_rows}"
     )
-    if st.button("Eksik koordinatları adresten bul", disabled=not geocode_consent):
-        progress = st.progress(0)
-        failures = []
-        missing_indices = list(employees.index[missing_mask])
-        for count, idx in enumerate(missing_indices, start=1):
-            address = employees.at[idx, "Adres"]
-            if not address:
-                failures.append(str(employees.at[idx, "Calisan_ID"]))
-            else:
-                try:
-                    found = cached_geocode(address, city, "v2")
-                except Exception:
-                    found = None
-                if found:
-                    employees.at[idx, "Enlem"], employees.at[idx, "Boylam"] = found
-                else:
-                    failures.append(str(employees.at[idx, "Calisan_ID"]))
-                time.sleep(1.05)
-            progress.progress(count / len(missing_indices))
-        st.session_state["geocoded_employees"] = employees
-        if failures:
-            if len(failures) == len(missing_indices):
-                st.error(
-                    "Hiçbir adres bulunamadı. Harita servisleri geçici olarak erişilemiyor olabilir. "
-                    "Biraz sonra yeniden deneyin."
-                )
-            else:
-                st.warning("Koordinatı bulunamayan siciller: " + ", ".join(failures))
-        else:
-            st.success("Eksik koordinatlar tamamlandı.")
-
-    st.markdown("##### Google My Maps ile toplu koordinat aktarma")
-    st.caption(
-        "Ücretsiz aramada bulunamayan adresler için aşağıdaki isim içermeyen dosyayı "
-        "Google My Maps'e aktarıp KML/KMZ olarak geri yükleyebilirsiniz."
-    )
-    st.download_button(
-        "1. My Maps için sicil-adres Excel'ini indir",
-        data=my_maps_workbook(employees),
-        file_name="MyMaps_Personel_Sicil_Adres.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    maps_file = st.file_uploader(
-        "2. My Maps'ten aldığınız KML veya KMZ dosyasını yükleyin",
-        type=["kml", "kmz"],
-        key="maps_kml_file",
-    )
-    if maps_file is not None and st.button("3. KML/KMZ koordinatlarını personelle eşleştir"):
-        try:
-            points = parse_kml_points(maps_file.getvalue(), maps_file.name)
-            employees, matched_count, outside_count = merge_kml_coordinates(employees, points)
-            st.session_state["geocoded_employees"] = employees
-            if matched_count:
-                st.success(f"My Maps dosyasından {matched_count} personelin koordinatı aktarıldı.")
-            else:
-                st.error(
-                    "KML/KMZ noktaları personelle eşleşmedi. My Maps'te işaretçi başlığı "
-                    "olarak 'Personel Sicil' sütununu seçtiğinizi kontrol edin."
-                )
-            if outside_count:
-                st.warning(f"Eskişehir dışında görünen {outside_count} nokta güvenlik için aktarılmadı.")
-        except Exception as exc:
-            st.error(f"KML/KMZ dosyası okunamadı: {exc}")
-
-found_coordinate_count = int(employees[["Enlem", "Boylam"]].notna().all(axis=1).sum())
-if found_coordinate_count:
-    st.download_button(
-        "📥 Koordinatlı personel Excel'ini indir",
-        data=coordinate_workbook(employees),
-        file_name="Eskisehir_Personel_Koordinatli.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Bu dosyayı saklayın. Sonraki rota hesaplamalarında yeniden adres aramadan kullanabilirsiniz.",
-    )
-    st.caption(f"Koordinatı hazır personel: {found_coordinate_count}/{len(employees)}")
+else:
+    st.success(f"{len(employees)} personelin koordinatı hazır. Rota hesabına geçebilirsiniz.")
 
 ready = not employees.empty and employees[["Enlem", "Boylam"]].notna().all(axis=1).all()
+road_ready = not use_road_network or road_consent
 st.subheader("2. Rotaları oluştur")
-if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready):
+if use_road_network and not road_consent:
+    st.info("Gerçek yol güzergâhı için sol menüdeki koordinat paylaşım onayını işaretleyin.")
+if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready or not road_ready):
     coordinates = [(factory_lat, factory_lon)] + list(zip(employees["Enlem"], employees["Boylam"]))
     with st.spinner("Rotalar hesaplanıyor..."):
         try:
@@ -416,7 +287,7 @@ if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready):
                 direction="morning" if direction_label.startswith("Sabah") else "evening",
                 wait_seconds_per_stop=0,
                 max_route_minutes=0,
-                use_road_network=True,
+                use_road_network=bool(use_road_network),
             )
             st.session_state["result"] = result
             st.session_state["result_employees"] = employees.copy()
@@ -445,7 +316,7 @@ nonempty_routes = [route for route in result.routes if route.occupancy]
 avg_fill = sum(route.occupancy for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 r1, r2, r3 = st.columns(3)
 r1.metric("Önerilen servis sayısı", result.vehicle_count)
-r2.metric("Toplam çalışan / durak", len(employees))
+r2.metric("Toplam çalışan", len(employees))
 r3.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
 
 palette = [
@@ -453,12 +324,25 @@ palette = [
     [230, 159, 0], [86, 180, 233], [204, 121, 167], [0, 114, 178],
 ]
 path_data = []
-point_data = [{"lon": factory_lon, "lat": factory_lat, "label": "Fabrika", "color": [196, 44, 44], "radius": 150}]
+point_data = [
+    {
+        "lon": factory_lon,
+        "lat": factory_lat,
+        "label": "Fabrika",
+        "stop_no": "F",
+        "color": [196, 44, 44],
+        "radius": 150,
+    }
+]
 
 for route in nonempty_routes:
     color = palette[(route.vehicle_no - 1) % len(palette)]
     ordered_coordinates = []
     labels = []
+    stop_number_by_index = {
+        matrix_index: order
+        for order, matrix_index in enumerate(route.employee_indices, start=1)
+    }
     for matrix_index in route.path_indices:
         if matrix_index == 0:
             ordered_coordinates.append((factory_lat, factory_lon))
@@ -470,7 +354,10 @@ for route in nonempty_routes:
             point_data.append(
                 {
                     "lon": float(row["Boylam"]), "lat": float(row["Enlem"]),
-                    "label": f"Rota {route.vehicle_no} · Durak: {labels[-1]}", "color": color, "radius": 95,
+                    "label": f"Rota {route.vehicle_no} · Durak {stop_number_by_index[matrix_index]}: {labels[-1]}",
+                    "stop_no": str(stop_number_by_index[matrix_index]),
+                    "color": color,
+                    "radius": 95,
                 }
             )
     try:
@@ -487,8 +374,26 @@ layers = [
         "ScatterplotLayer", point_data, get_position="[lon, lat]", get_fill_color="color",
         get_radius="radius", radius_min_pixels=5, radius_max_pixels=13, pickable=True,
     ),
+    pdk.Layer(
+        "TextLayer",
+        point_data,
+        get_position="[lon, lat]",
+        get_text="stop_no",
+        get_color=[255, 255, 255],
+        get_size=11,
+        get_alignment_baseline="center",
+        get_text_anchor="middle",
+        pickable=False,
+    ),
 ]
-view_state = pdk.ViewState(latitude=factory_lat, longitude=factory_lon, zoom=11.2, pitch=0)
+all_lats = [factory_lat, *employees["Enlem"].astype(float).tolist()]
+all_lons = [factory_lon, *employees["Boylam"].astype(float).tolist()]
+view_state = pdk.ViewState(
+    latitude=(min(all_lats) + max(all_lats)) / 2,
+    longitude=(min(all_lons) + max(all_lons)) / 2,
+    zoom=9.8,
+    pitch=0,
+)
 deck = pdk.Deck(
     layers=layers,
     initial_view_state=view_state,
@@ -498,20 +403,28 @@ deck = pdk.Deck(
 st.pydeck_chart(deck, use_container_width=True)
 
 for route in nonempty_routes:
-    stop_names = []
-    for matrix_index in route.employee_indices:
-        row = employees.iloc[matrix_index - 1]
-        stop_names.append(str(row["Adres"] or row["Ad_Soyad"] or row["Calisan_ID"]))
-    numbered_stops = [f"{number}. {name}" for number, name in enumerate(stop_names, start=1)]
-    if result_direction.startswith("Sabah"):
-        sequence = " → ".join([*numbered_stops, "Fabrika"])
-    else:
-        sequence = " → ".join(["Fabrika", *numbered_stops])
     st.markdown(
-        f"""<div class="route-card"><b>Rota {route.vehicle_no}</b> · {route.occupancy}/{result_capacity} yolcu<br>
-        <span class="muted"><b>Duraklar:</b> {sequence}</span></div>""",
+        f"""<div class="route-card"><b>Rota {route.vehicle_no}</b> · {route.occupancy}/{result_capacity} yolcu ·
+        {route.distance_km:.1f} km · {route.drive_minutes:.0f} dk</div>""",
         unsafe_allow_html=True,
     )
+    stop_rows = []
+    if not result_direction.startswith("Sabah"):
+        stop_rows.append({"Durak": "Başlangıç", "Sicil": "-", "Ad Soyad": "Fabrika", "Adres": factory_address})
+    for order, matrix_index in enumerate(route.employee_indices, start=1):
+        row = employees.iloc[matrix_index - 1]
+        stop_rows.append(
+            {
+                "Durak": order,
+                "Sicil": row["Calisan_ID"],
+                "Ad Soyad": row["Ad_Soyad"],
+                "Adres": row["Adres"],
+            }
+        )
+    if result_direction.startswith("Sabah"):
+        stop_rows.append({"Durak": "Varış", "Sicil": "-", "Ad Soyad": "Fabrika", "Adres": factory_address})
+    with st.expander(f"Rota {route.vehicle_no} durak listesini göster"):
+        st.dataframe(pd.DataFrame(stop_rows), use_container_width=True, hide_index=True)
 
 export_bytes = result_workbook(result, employees, result_capacity)
 st.download_button(

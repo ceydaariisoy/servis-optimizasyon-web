@@ -8,12 +8,15 @@ erişilemezse kuş uçuşu mesafe tabanlı tahmine otomatik geçilir.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 import json
 import math
 import re
 from typing import Iterable, Sequence
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
+from zipfile import ZipFile
 
 
 EARTH_RADIUS_KM = 6371.0088
@@ -184,7 +187,7 @@ def clean_address_for_geocoding(address: str, city: str = "Eskişehir, Türkiye"
     return text
 
 
-def _is_in_eskisehir(lat: float, lon: float) -> bool:
+def is_eskisehir_coordinate(lat: float, lon: float) -> bool:
     return haversine_km((lat, lon), ESKISEHIR_CENTER) <= ESKISEHIR_MAX_DISTANCE_KM
 
 
@@ -202,7 +205,7 @@ def _geocode_nominatim(query: str, timeout: int) -> tuple[float, float] | None:
     if not payload:
         return None
     point = float(payload[0]["lat"]), float(payload[0]["lon"])
-    return point if _is_in_eskisehir(*point) else None
+    return point if is_eskisehir_coordinate(*point) else None
 
 
 def _geocode_photon(query: str, timeout: int) -> tuple[float, float] | None:
@@ -225,7 +228,7 @@ def _geocode_photon(query: str, timeout: int) -> tuple[float, float] | None:
         return None
     lon, lat = features[0]["geometry"]["coordinates"]
     point = float(lat), float(lon)
-    return point if _is_in_eskisehir(*point) else None
+    return point if is_eskisehir_coordinate(*point) else None
 
 
 def geocode_address(address: str, city: str = "Eskişehir, Türkiye", timeout: int = 15) -> tuple[float, float] | None:
@@ -241,6 +244,41 @@ def geocode_address(address: str, city: str = "Eskişehir, Türkiye", timeout: i
         return _geocode_photon(query, timeout)
     except Exception:
         return None
+
+
+def parse_kml_points(file_bytes: bytes, filename: str = "harita.kml") -> list[dict[str, object]]:
+    """Google My Maps KML/KMZ dosyasındaki ad, metin ve nokta koordinatlarını okur."""
+    kml_bytes = file_bytes
+    if filename.casefold().endswith(".kmz"):
+        with ZipFile(BytesIO(file_bytes)) as archive:
+            kml_names = [name for name in archive.namelist() if name.casefold().endswith(".kml")]
+            if not kml_names:
+                raise ValueError("KMZ dosyasının içinde KML bulunamadı.")
+            kml_bytes = archive.read(kml_names[0])
+
+    root = ElementTree.fromstring(kml_bytes)
+    points: list[dict[str, object]] = []
+    for placemark in root.findall(".//{*}Placemark"):
+        coordinate_node = placemark.find(".//{*}Point/{*}coordinates")
+        if coordinate_node is None or not coordinate_node.text:
+            continue
+        first_coordinate = coordinate_node.text.strip().split()[0]
+        parts = first_coordinate.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            lon, lat = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        name_node = placemark.find("./{*}name")
+        name = name_node.text.strip() if name_node is not None and name_node.text else ""
+        all_text = " ".join(
+            node.text.strip() for node in placemark.iter() if node.text and node.text.strip()
+        )
+        points.append({"name": name, "text": all_text, "lat": lat, "lon": lon})
+    if not points:
+        raise ValueError("KML/KMZ dosyasında nokta bulunamadı.")
+    return points
 
 
 def _route_path(employee_indices: Sequence[int], direction: str) -> list[int]:

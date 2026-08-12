@@ -3,13 +3,20 @@ from __future__ import annotations
 from io import BytesIO
 import hashlib
 import math
+import re
 import time
 
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-from core import fetch_osrm_geometry, geocode_address, plan_routes
+from core import (
+    fetch_osrm_geometry,
+    geocode_address,
+    is_eskisehir_coordinate,
+    parse_kml_points,
+    plan_routes,
+)
 
 
 st.set_page_config(page_title="Servis Rota Optimizasyonu", page_icon="🚌", layout="wide")
@@ -200,6 +207,52 @@ def coordinate_workbook(employees: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def my_maps_workbook(employees: pd.DataFrame) -> bytes:
+    """Google My Maps'e aktarılacak, isim içermeyen sicil-adres dosyasını üretir."""
+    export_frame = employees[["Calisan_ID", "Adres"]].rename(
+        columns={"Calisan_ID": "Personel Sicil", "Adres": "ADRES"}
+    )
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        export_frame.to_excel(writer, sheet_name="MyMaps", index=False)
+        sheet = writer.sheets["MyMaps"]
+        header = writer.book.add_format({"bold": True, "font_color": "white", "bg_color": "#285A84"})
+        for col, name in enumerate(export_frame.columns):
+            sheet.write(0, col, name, header)
+        sheet.set_column("A:A", 18)
+        sheet.set_column("B:B", 75)
+        sheet.freeze_panes(1, 0)
+    return output.getvalue()
+
+
+def employee_id_key(value: object) -> str:
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def merge_kml_coordinates(employees: pd.DataFrame, points: list[dict[str, object]]):
+    merged = employees.copy()
+    index_by_id = {employee_id_key(value): idx for idx, value in merged["Calisan_ID"].items()}
+    matched_indices: set[int] = set()
+    outside_count = 0
+    for point in points:
+        lat, lon = float(point["lat"]), float(point["lon"])
+        if not is_eskisehir_coordinate(lat, lon):
+            outside_count += 1
+            continue
+        candidates = [employee_id_key(point.get("name", ""))]
+        candidates.extend(re.findall(r"(?<!\d)\d{3,8}(?!\d)", str(point.get("text", ""))))
+        matched_index = next((index_by_id[key] for key in candidates if key in index_by_id), None)
+        if matched_index is None:
+            continue
+        merged.at[matched_index, "Enlem"] = lat
+        merged.at[matched_index, "Boylam"] = lon
+        matched_indices.add(matched_index)
+    return merged, len(matched_indices), outside_count
+
+
 with st.sidebar:
     st.header("Planlama ayarları")
     mode_label = st.radio(
@@ -304,6 +357,39 @@ if missing_mask.any():
                 st.warning("Koordinatı bulunamayan siciller: " + ", ".join(failures))
         else:
             st.success("Eksik koordinatlar tamamlandı.")
+
+    st.markdown("##### Google My Maps ile toplu koordinat aktarma")
+    st.caption(
+        "Ücretsiz aramada bulunamayan adresler için aşağıdaki isim içermeyen dosyayı "
+        "Google My Maps'e aktarıp KML/KMZ olarak geri yükleyebilirsiniz."
+    )
+    st.download_button(
+        "1. My Maps için sicil-adres Excel'ini indir",
+        data=my_maps_workbook(employees),
+        file_name="MyMaps_Personel_Sicil_Adres.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    maps_file = st.file_uploader(
+        "2. My Maps'ten aldığınız KML veya KMZ dosyasını yükleyin",
+        type=["kml", "kmz"],
+        key="maps_kml_file",
+    )
+    if maps_file is not None and st.button("3. KML/KMZ koordinatlarını personelle eşleştir"):
+        try:
+            points = parse_kml_points(maps_file.getvalue(), maps_file.name)
+            employees, matched_count, outside_count = merge_kml_coordinates(employees, points)
+            st.session_state["geocoded_employees"] = employees
+            if matched_count:
+                st.success(f"My Maps dosyasından {matched_count} personelin koordinatı aktarıldı.")
+            else:
+                st.error(
+                    "KML/KMZ noktaları personelle eşleşmedi. My Maps'te işaretçi başlığı "
+                    "olarak 'Personel Sicil' sütununu seçtiğinizi kontrol edin."
+                )
+            if outside_count:
+                st.warning(f"Eskişehir dışında görünen {outside_count} nokta güvenlik için aktarılmadı.")
+        except Exception as exc:
+            st.error(f"KML/KMZ dosyası okunamadı: {exc}")
 
 found_coordinate_count = int(employees[["Enlem", "Boylam"]].notna().all(axis=1).sum())
 if found_coordinate_count:

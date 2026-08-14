@@ -57,6 +57,11 @@ class CommonStop:
     anchor_index: int
     member_indices: list[int]
     walking_distances_m: list[float]
+    latitude: float | None = None
+    longitude: float | None = None
+    label: str = ""
+    source: str = "Çalışan adresi"
+    matrix_index: int | None = None
 
     @property
     def passenger_count(self) -> int:
@@ -71,6 +76,16 @@ class CommonStop:
         if not self.walking_distances_m:
             return 0.0
         return sum(self.walking_distances_m) / len(self.walking_distances_m)
+
+
+@dataclass(frozen=True)
+class CandidateStop:
+    """Literatürdeki SBRP-BSS modeli için ziyaret edilebilecek aday durak."""
+
+    latitude: float
+    longitude: float
+    label: str
+    source: str
 
 
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -181,6 +196,191 @@ def cluster_common_stops(
     return stops
 
 
+def generate_candidate_stops(
+    employee_coordinates: Sequence[tuple[float, float]],
+    max_walk_m: float = 500.0,
+    walking_factor: float = 1.20,
+    approved_candidates: Sequence[tuple[float, float, str]] | None = None,
+) -> list[CandidateStop]:
+    """Çalışan adresleri, ortak ara noktalar ve onaylı noktalardan aday kümesi üretir.
+
+    İki çalışan arasındaki kuş uçuşu mesafe, ikisinin de azami yürüyüş sınırı
+    içinde kalabileceği kadar kısaysa orta noktaları aday yapılır. Aynı çalışan
+    kümesini kapsayan adaylardan onaylı olan; onaylı yoksa toplam yürüyüşü daha
+    kısa olan tutulur. Çalışan adresleri, kapsama garantisi veren yedek adaylardır.
+    """
+    if not employee_coordinates:
+        return []
+    if walking_factor < 1:
+        raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
+
+    raw_candidates: list[CandidateStop] = []
+    for index, (lat, lon) in enumerate(employee_coordinates, start=1):
+        raw_candidates.append(
+            CandidateStop(float(lat), float(lon), f"Adres tabanlı yedek durak {index}", "Çalışan adresi")
+        )
+
+    approved_candidates = approved_candidates or []
+    for index, (lat, lon, label) in enumerate(approved_candidates, start=1):
+        raw_candidates.append(
+            CandidateStop(
+                float(lat),
+                float(lon),
+                str(label).strip() or f"Onaylı durak {index}",
+                "Onaylı durak",
+            )
+        )
+
+    straight_radius_m = max_walk_m / walking_factor
+    midpoint_no = 1
+    for first in range(len(employee_coordinates)):
+        for second in range(first + 1, len(employee_coordinates)):
+            if (
+                haversine_km(employee_coordinates[first], employee_coordinates[second]) * 1000
+                <= 2 * straight_radius_m + 1e-9
+            ):
+                lat = (employee_coordinates[first][0] + employee_coordinates[second][0]) / 2
+                lon = (employee_coordinates[first][1] + employee_coordinates[second][1]) / 2
+                raw_candidates.append(
+                    CandidateStop(lat, lon, f"Otomatik ortak durak {midpoint_no}", "Otomatik ortak nokta")
+                )
+                midpoint_no += 1
+
+    source_priority = {"Onaylı durak": 0, "Otomatik ortak nokta": 1, "Çalışan adresi": 2}
+    best_by_coverage: dict[tuple[int, ...], tuple[tuple[int, float], CandidateStop]] = {}
+    for candidate in raw_candidates:
+        distances = [
+            haversine_km((candidate.latitude, candidate.longitude), employee) * 1000 * walking_factor
+            for employee in employee_coordinates
+        ]
+        coverage = tuple(index for index, distance in enumerate(distances) if distance <= max_walk_m + 1e-9)
+        if not coverage:
+            continue
+        score = (source_priority.get(candidate.source, 9), sum(distances[index] for index in coverage))
+        if coverage not in best_by_coverage or score < best_by_coverage[coverage][0]:
+            best_by_coverage[coverage] = (score, candidate)
+
+    return [value[1] for value in best_by_coverage.values()]
+
+
+def optimize_candidate_stops(
+    employee_coordinates: Sequence[tuple[float, float]],
+    candidates: Sequence[CandidateStop],
+    max_walk_m: float = 500.0,
+    target_average_walk_m: float = 300.0,
+    walking_factor: float = 1.20,
+    time_limit_seconds: int = 8,
+) -> tuple[list[CommonStop], int, bool]:
+    """Aday durakları set-cover + hedef programlama mantığıyla seçer.
+
+    Birinci aşama, tüm çalışanları kapsayan kesin minimum durak sayısını bulur.
+    İkinci aşama, hedef ortalama yürüyüş sağlanana kadar en fazla yürüyüş
+    iyileştirmesi sağlayan adayları ekler. Bu, minimum durak ile çalışan konforu
+    arasındaki Pareto dengesini görünür ve denetlenebilir kılar.
+    """
+    if not employee_coordinates:
+        return [], 0, True
+    if not candidates:
+        raise ValueError("Ortak durak optimizasyonu için aday durak bulunamadı.")
+
+    distances_m = [
+        [
+            haversine_km((candidate.latitude, candidate.longitude), employee) * 1000 * walking_factor
+            for employee in employee_coordinates
+        ]
+        for candidate in candidates
+    ]
+    cover_by_employee = [
+        [
+            candidate_index
+            for candidate_index in range(len(candidates))
+            if distances_m[candidate_index][employee_index] <= max_walk_m + 1e-9
+        ]
+        for employee_index in range(len(employee_coordinates))
+    ]
+    for employee_index, covering in enumerate(cover_by_employee):
+        if not covering:
+            raise ValueError(f"{employee_index + 1}. çalışan için erişilebilir aday durak bulunamadı.")
+
+    model = cp_model.CpModel()
+    selected_vars = [model.new_bool_var(f"candidate_{index}") for index in range(len(candidates))]
+    for covering in cover_by_employee:
+        model.add(sum(selected_vars[index] for index in covering) >= 1)
+    model.minimize(sum(selected_vars))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 42
+    status = solver.solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise ValueError("Aday duraklar için kapsama çözümü bulunamadı.")
+
+    selected = {index for index, variable in enumerate(selected_vars) if solver.value(variable)}
+    minimum_stop_count = len(selected)
+    minimum_proven = status == cp_model.OPTIMAL
+
+    def walking_assignment(selected_indices: set[int]) -> tuple[list[int], list[float]]:
+        assigned: list[int] = []
+        walks: list[float] = []
+        for employee_index, covering in enumerate(cover_by_employee):
+            feasible = [index for index in covering if index in selected_indices]
+            chosen = min(feasible, key=lambda index: (distances_m[index][employee_index], index))
+            assigned.append(chosen)
+            walks.append(distances_m[chosen][employee_index])
+        return assigned, walks
+
+    assigned, walks = walking_assignment(selected)
+    target = min(max(target_average_walk_m, 0), max_walk_m)
+    while walks and sum(walks) / len(walks) > target:
+        best_candidate = None
+        best_improvement = 0.0
+        for candidate_index in range(len(candidates)):
+            if candidate_index in selected:
+                continue
+            improvement = sum(
+                max(0.0, walks[employee_index] - distances_m[candidate_index][employee_index])
+                for employee_index in range(len(employee_coordinates))
+                if distances_m[candidate_index][employee_index] <= max_walk_m + 1e-9
+            )
+            if improvement > best_improvement + 1e-9:
+                best_candidate = candidate_index
+                best_improvement = improvement
+        if best_candidate is None:
+            break
+        selected.add(best_candidate)
+        assigned, walks = walking_assignment(selected)
+
+    members_by_candidate: dict[int, list[int]] = {index: [] for index in selected}
+    walks_by_candidate: dict[int, list[float]] = {index: [] for index in selected}
+    for employee_index, candidate_index in enumerate(assigned):
+        members_by_candidate[candidate_index].append(employee_index)
+        walks_by_candidate[candidate_index].append(walks[employee_index])
+
+    stops: list[CommonStop] = []
+    for candidate_index in sorted(selected):
+        members = members_by_candidate[candidate_index]
+        if not members:
+            continue
+        candidate = candidates[candidate_index]
+        member_walk_pairs = sorted(
+            zip(members, walks_by_candidate[candidate_index]),
+            key=lambda pair: (pair[1], pair[0]),
+        )
+        stops.append(
+            CommonStop(
+                anchor_index=candidate_index,
+                member_indices=[pair[0] for pair in member_walk_pairs],
+                walking_distances_m=[pair[1] for pair in member_walk_pairs],
+                latitude=candidate.latitude,
+                longitude=candidate.longitude,
+                label=candidate.label,
+                source=candidate.source,
+            )
+        )
+    return stops, minimum_stop_count, minimum_proven
+
+
 def build_estimated_matrices(
     coordinates: Sequence[tuple[float, float]], average_speed_kmh: float = 32.0
 ) -> tuple[list[list[float]], list[list[float]]]:
@@ -259,6 +459,26 @@ def fetch_osrm_table(
                     durations[source_index][destination_index] = duration_block[source_position][destination_position]
                     distances[source_index][destination_index] = distance_block[source_position][destination_position]
     return durations, distances
+
+
+def get_travel_matrices(
+    coordinates: Sequence[tuple[float, float]],
+    use_road_network: bool = True,
+    average_speed_kmh: float = 38.0,
+) -> tuple[list[list[float]], list[list[float]], str, list[str]]:
+    """OSRM veya yaklaşık yöntemle rota matrislerini ve kullanıcı uyarılarını döndürür."""
+    warnings: list[str] = []
+    if not use_road_network:
+        durations, distances = build_estimated_matrices(coordinates, average_speed_kmh)
+        return durations, distances, "Yaklaşık mesafe", warnings
+    try:
+        durations, distances = fetch_osrm_table(coordinates)
+        source = "OSRM yol ağı"
+    except Exception as exc:
+        durations, distances = build_estimated_matrices(coordinates, average_speed_kmh)
+        source = "Yaklaşık mesafe"
+        warnings.append(f"Yol ağı verisi kullanılamadı; yaklaşık mesafeye geçildi ({exc}).")
+    return durations, distances, source, warnings
 
 
 def fetch_osrm_geometry(
@@ -584,7 +804,10 @@ def assign_common_stops_to_routes(
         raise ValueError("Bir ortak durağın yolcu sayısı araç kapasitesini aşıyor.")
 
     # Yerel düğümler: 0=fabrika, 1..N=ortak durak, son düğüm=serbest başlangıç/bitiş.
-    stop_matrix_indices = [stop.anchor_index + 1 for stop in stops]
+    stop_matrix_indices = [
+        stop.matrix_index if stop.matrix_index is not None else stop.anchor_index + 1
+        for stop in stops
+    ]
     dummy_node = len(stops) + 1
     node_count = dummy_node + 1
     starts = [dummy_node] * vehicle_count if direction == "morning" else [0] * vehicle_count

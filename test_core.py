@@ -5,6 +5,8 @@ from core import (
     assign_common_stops_to_routes,
     build_estimated_matrices,
     cluster_common_stops,
+    generate_candidate_stops,
+    optimize_candidate_stops,
     plan_routes,
 )
 
@@ -54,6 +56,35 @@ class RoutePlannerTests(unittest.TestCase):
         assigned = [employee for stop in stops for employee in stop.member_indices]
         self.assertEqual(len(stops), 1)
         self.assertEqual(sorted(assigned), list(range(len(close_coordinates))))
+        self.assertLessEqual(stops[0].max_walk_m, 500)
+
+    def test_midpoint_candidate_can_cover_two_employees_with_one_stop(self):
+        # Evler yaklaşık 600 m ayrı olsa da ortadaki ortak nokta iki çalışana da
+        # 500 m sınırı içinde kalır. Sadece ev adreslerini aday alan model bunu
+        # göremez; durak seçimi içeren modelin temel farkı budur.
+        employee_coordinates = [
+            (39.77600, 30.52000),
+            (39.78140, 30.52000),
+        ]
+        candidates = generate_candidate_stops(
+            employee_coordinates,
+            max_walk_m=500,
+            walking_factor=1.0,
+        )
+        stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
+            employee_coordinates,
+            candidates,
+            max_walk_m=500,
+            target_average_walk_m=500,
+            walking_factor=1.0,
+            time_limit_seconds=2,
+        )
+        assigned = [employee for stop in stops for employee in stop.member_indices]
+        self.assertEqual(minimum_stop_count, 1)
+        self.assertTrue(minimum_proven)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(sorted(assigned), [0, 1])
+        self.assertEqual(stops[0].source, "Otomatik ortak nokta")
         self.assertLessEqual(stops[0].max_walk_m, 500)
 
     def test_ortools_routes_respect_capacity_without_splitting_stops(self):

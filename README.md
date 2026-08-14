@@ -13,7 +13,7 @@ Uygulanan problem sınıfı **durak seçimi içeren okul/personel servisi rotala
 
 - Mevcut **3 servis** veya kapasite ve azami süreye göre **otomatik servis sayısı** seçimi
 - Tüm araçlar için ortak kapasite sınırı
-- Çalışan adresleri, otomatik ortak ara noktalar ve isteğe bağlı onaylı duraklardan aday kümesi
+- Çalışan adresleri, otomatik ortak ara noktalar ve yüklenen mevcut/adayı duraklardan aday kümesi
 - CP-SAT set-cover modeliyle tüm çalışanları kapsayan **teorik minimum durak sayısı**
 - Minimum durak ile çalışan konforu arasında ayarlanabilir **hedef ortalama yürüme** dengesi
 - Her çalışanın tam bir durağa atanması ve azami yürüme sınırının korunması
@@ -22,13 +22,16 @@ Uygulanan problem sınıfı **durak seçimi içeren okul/personel servisi rotala
 - Sabah (çalışan → fabrika) ve akşam (fabrika → çalışan) yönü
 - Aktif olmayan veya servis kullanmayan çalışanları dışarıda bırakma
 - Yeni çalışan eklendiğinde ya da çalışan ayrıldığında güncel Excel ile yeniden hesaplama
+- Günlük değişiklikler için önceki durak ve rota sırasını koruyan **artımlı güncelleme modu**
+- Yeni çalışanı önce erişilebilir mevcut durağa ekleme; yalnızca gerekirse yeni durak veya araç açma
+- **Yalnızca yüklenen duraklar** ya da **yüklenen + saha onayına sunulacak otomatik adaylar** politikası
 - OSRM yol süreleri; erişim olmazsa yaklaşık mesafeye otomatik geçiş
 - Harita, rota sırası, sürüş/toplam süre, mesafe, doluluk, tekil/ortak durak ve Excel sonuç indirme
 
 ## Modelin aşamaları
 
 1. Aday duraklar üretilir. Çalışan evleri her zaman yedek adaydır; birbirine yakın
-   ev çiftlerinin orta noktaları ortak durak adayı olur. Onaylı durak dosyası varsa
+   ev çiftlerinin orta noktaları ortak durak adayı olur. Mevcut/adayı durak dosyası varsa
    bu noktalar öncelikli aday olarak eklenir.
 2. CP-SAT set-cover modeli, her çalışan azami yürüme sınırındaki en az bir durakla
    kapsanacak şekilde teorik minimum durak sayısını bulur.
@@ -70,18 +73,40 @@ kişilerle paylaşabilirsiniz. Bağımlılıklar `requirements.txt` dosyasından
 Enlem ve boylam tüm aktif çalışanlar için doldurulmalıdır. Fabrika koordinatları gerçek servis
 kapısı konumuyla değiştirilmelidir.
 
-### Onaylı durak dosyası (önerilir)
+### Mevcut / aday durak dosyası (önerilir)
 
-Saha ekibinin güvenli olduğunu doğruladığı gerçek durakları ayrıca yükleyebilirsiniz.
+Mevcut durakları ve saha ekibinin değerlendireceği aday noktaları ayrıca yükleyebilirsiniz.
 Dosyada şu sütunlar bulunmalıdır:
 
 - `Durak_Adi` (isteğe bağlı)
 - `Enlem`
 - `Boylam`
 
-Onaylı durak dosyası kullanılmazsa sistem geometrik ortak noktalar üretir. Bu noktalar
+`Saha_Onayi` sütununda `Uygun Değil` veya `Reddedildi` olan satırlar kullanılmaz;
+`Bekliyor` olan satırlar planlama adayı olarak kalır ve kesinleştirilmeden önce sahada
+kontrol edilmelidir. Durak dosyası kullanılmazsa sistem geometrik ortak noktalar üretir. Bu noktalar
 matematiksel adaydır; servise alınmadan önce güvenli bekleme alanı, yol tarafı, yaya
 geçidi ve kaldırım açısından sahada onaylanmalıdır.
+
+## Yeni çalışan ve adres değişikliği
+
+İlk plan için **Tam optimizasyon** çalıştırılır ve `servis_rota_sonuclari.xlsx` dosyası
+indirilir. Daha sonra çalışan Excel'i güncellendiğinde **Mevcut planı koruyarak güncelle**
+seçilir; önceki sonuç Excel'i de uygulamaya yüklenir.
+
+Artımlı mod şu sırayla çalışır:
+
+1. Hâlâ aktif olan çalışanların önceki durak ve rota eşleşmesini korur.
+2. Yeni veya adresi değişen çalışanı 500 m sınırındaki mevcut durağa eklemeyi dener.
+3. Uygun mevcut durak yoksa yüklenen durak adaylarını değerlendirir.
+4. Seçilen politika izin veriyorsa yalnızca gerekli bölgede otomatik aday durak önerir.
+5. Yeni durağı mevcut durak sırasını bozmadan en düşük ek süreli yere ekler.
+6. Kapasite veya süre yetmezse otomatik modda yeni araç açar; sabit 3 araç modunda
+   kullanıcıya tam optimizasyon veya kapasite değişikliği gerektiğini bildirir.
+
+İşten ayrılan çalışanı silmek yerine `Aktif_mi=Hayır` veya
+`Servis_Kullaniyor_mu=Hayır` yapmak kayıt geçmişinin korunmasını sağlar. Artımlı
+eşleştirme için çalışan sicil/ID değerleri dolu ve benzersiz olmalıdır.
 
 ## Önemli not
 

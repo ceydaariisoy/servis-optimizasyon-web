@@ -8,6 +8,7 @@ from core import (
     generate_candidate_stops,
     optimize_candidate_stops,
     plan_routes,
+    update_routes_incrementally,
 )
 
 
@@ -117,6 +118,102 @@ class RoutePlannerTests(unittest.TestCase):
         assigned_anchors = [stop.anchor_index for route in routes for stop in route]
         self.assertEqual(sorted(assigned_anchors), [0, 2, 4])
         self.assertTrue(all(sum(stop.passenger_count for stop in route) <= 4 for route in routes))
+
+    def test_approved_only_policy_does_not_generate_home_or_midpoint_candidates(self):
+        employee_coordinates = [(39.7760, 30.5200), (39.7810, 30.5200)]
+        candidates = generate_candidate_stops(
+            employee_coordinates,
+            max_walk_m=500,
+            walking_factor=1.0,
+            approved_candidates=[(39.7785, 30.5200, "Onaylı ortak durak")],
+            allow_automatic_candidates=False,
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, "Yüklenen aday durak")
+
+    def test_incremental_update_adds_new_employee_to_existing_stop(self):
+        employee_coordinates = [
+            (39.77600, 30.52000),
+            (39.78500, 30.50000),
+            (39.77620, 30.52010),
+        ]
+        baseline_routes = [
+            [
+                CommonStop(
+                    anchor_index=0,
+                    member_indices=[0],
+                    walking_distances_m=[0],
+                    latitude=39.77600,
+                    longitude=30.52000,
+                    label="Mevcut durak 1",
+                    source="Onaylı durak",
+                )
+            ],
+            [
+                CommonStop(
+                    anchor_index=1,
+                    member_indices=[1],
+                    walking_distances_m=[0],
+                    latitude=39.78500,
+                    longitude=30.50000,
+                    label="Mevcut durak 2",
+                    source="Onaylı durak",
+                )
+            ],
+        ]
+        routes, _, _, meta = update_routes_incrementally(
+            employee_coordinates=employee_coordinates,
+            baseline_routes=baseline_routes,
+            factory_coordinates=(39.7767, 30.5206),
+            max_walk_m=500,
+            target_average_walk_m=300,
+            capacity=2,
+            direction="morning",
+            max_route_minutes=120,
+            mode="auto",
+            use_road_network=False,
+        )
+        assigned = [employee for route in routes for stop in route for employee in stop.member_indices]
+        self.assertEqual(sorted(assigned), [0, 1, 2])
+        self.assertEqual(meta["preserved_employee_count"], 2)
+        self.assertEqual(meta["added_to_existing_count"], 1)
+        self.assertEqual(meta["new_stop_count"], 0)
+
+    def test_incremental_update_creates_only_local_change_when_needed(self):
+        employee_coordinates = [
+            (39.77600, 30.52000),
+            (39.79000, 30.49000),
+        ]
+        baseline_routes = [
+            [
+                CommonStop(
+                    anchor_index=0,
+                    member_indices=[0],
+                    walking_distances_m=[0],
+                    latitude=39.77600,
+                    longitude=30.52000,
+                    label="Mevcut durak",
+                    source="Onaylı durak",
+                )
+            ]
+        ]
+        routes, _, _, meta = update_routes_incrementally(
+            employee_coordinates=employee_coordinates,
+            baseline_routes=baseline_routes,
+            factory_coordinates=(39.7767, 30.5206),
+            max_walk_m=500,
+            target_average_walk_m=300,
+            capacity=4,
+            direction="morning",
+            max_route_minutes=120,
+            mode="auto",
+            use_road_network=False,
+            allow_automatic_candidates=True,
+        )
+        assigned = [employee for route in routes for stop in route for employee in stop.member_indices]
+        self.assertEqual(sorted(assigned), [0, 1])
+        self.assertEqual(meta["preserved_employee_count"], 1)
+        self.assertEqual(meta["new_stop_count"], 1)
 
 
 if __name__ == "__main__":

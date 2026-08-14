@@ -3,17 +3,20 @@ from __future__ import annotations
 from io import BytesIO
 import hashlib
 import math
+import re
 
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
 from core import (
+    CommonStop,
     assign_common_stops_to_routes,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
+    update_routes_incrementally,
 )
 
 
@@ -126,7 +129,12 @@ def get_mapping(df: pd.DataFrame):
 def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     df = df.dropna(how="all").copy()
     out = pd.DataFrame(index=df.index)
-    out["Calisan_ID"] = df[mapping["id"]] if mapping["id"] else range(len(df))
+    id_values = (
+        df[mapping["id"]]
+        if mapping["id"]
+        else pd.Series(range(len(df)), index=df.index)
+    )
+    out["Calisan_ID"] = id_values.fillna("").astype(str).str.strip()
     out["Ad_Soyad"] = df[mapping["name"]].fillna("").astype(str) if mapping["name"] else ""
     out["Tip"] = df[mapping["type"]].fillna("Çalışan").astype(str) if mapping["type"] else "Çalışan"
     out["Adres"] = df[mapping["address"]].fillna("").astype(str) if mapping["address"] else ""
@@ -139,15 +147,15 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out
 
 
-def read_approved_candidates(uploaded_file) -> list[tuple[float, float, str]]:
-    """İsteğe bağlı onaylı durak Excel'inden enlem, boylam ve durak adını okur."""
+def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, str]], dict]:
+    """Durak Excel'ini okur; reddedilenleri dışlar ve onay durumunu sayar."""
     if uploaded_file is None:
-        return []
+        return [], {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     frame = pd.read_excel(BytesIO(uploaded_file.getvalue())).dropna(how="all")
     lat_col = detect_column(frame.columns, "lat")
     lon_col = detect_column(frame.columns, "lon")
     if lat_col is None or lon_col is None:
-        raise ValueError("Onaylı durak dosyasında `Enlem` ve `Boylam` sütunları bulunmalıdır.")
+        raise ValueError("Durak dosyasında `Enlem` ve `Boylam` sütunları bulunmalıdır.")
     normalized = {normalize(column): column for column in frame.columns}
     name_col = next(
         (
@@ -157,17 +165,174 @@ def read_approved_candidates(uploaded_file) -> list[tuple[float, float, str]]:
         ),
         None,
     )
+    status_col = normalized.get("saha_onayi") or normalized.get("onay_durumu")
     candidates: list[tuple[float, float, str]] = []
+    stats = {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     for row_no, (_, row) in enumerate(frame.iterrows(), start=1):
         lat = pd.to_numeric(row[lat_col], errors="coerce")
         lon = pd.to_numeric(row[lon_col], errors="coerce")
         if pd.isna(lat) or pd.isna(lon):
             continue
-        label = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else f"Onaylı durak {row_no}"
+        status = normalize(row[status_col]) if status_col and not pd.isna(row[status_col]) else ""
+        if status in {"uygun_degil", "reddedildi", "red", "hayir", "kullanilmayacak"}:
+            stats["excluded"] += 1
+            continue
+        label = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else f"Yüklenen durak {row_no}"
         candidates.append((float(lat), float(lon), label))
-    if not candidates:
-        raise ValueError("Onaylı durak dosyasında geçerli koordinat bulunamadı.")
-    return candidates
+        stats["loaded"] += 1
+        if status in {"onaylandi", "onayli", "evet", "uygun"}:
+            stats["approved"] += 1
+        else:
+            stats["pending"] += 1
+    if not candidates and not stats["excluded"]:
+        raise ValueError("Durak dosyasında geçerli koordinat bulunamadı.")
+    return candidates, stats
+
+
+def normalize_employee_id(value: object) -> str:
+    """Excel'in 123, 123.0 ve metin biçimlerini aynı sicil olarak eşleştirir."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text.casefold()
+
+
+def route_number(value: object) -> int:
+    match = re.search(r"\d+", str(value))
+    if not match:
+        raise ValueError(f"Önceki sonuç dosyasında rota numarası okunamadı: {value}")
+    return int(match.group())
+
+
+def read_previous_routes(uploaded_file, employees: pd.DataFrame) -> list[list[CommonStop]]:
+    """Uygulamanın indirdiği sonuç Excel'ini artımlı plan için geri okur."""
+    if uploaded_file is None:
+        raise ValueError(
+            "Mevcut planı koruma modu için daha önce indirdiğiniz "
+            "`servis_rota_sonuclari.xlsx` dosyasını yükleyin."
+        )
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else bytes(uploaded_file)
+    try:
+        stops = pd.read_excel(BytesIO(raw), sheet_name="Ortak_Duraklar").dropna(how="all")
+        assignments = pd.read_excel(
+            BytesIO(raw),
+            sheet_name="Personel_Durak_Eslesmesi",
+        ).dropna(how="all")
+    except Exception as exc:
+        raise ValueError(
+            "Önceki plan dosyası, uygulamadan indirilen rota sonuç Excel'i olmalıdır."
+        ) from exc
+
+    required_stops = {"Rota", "Durak_Sirasi", "Durak_Adi", "Enlem", "Boylam"}
+    required_assignments = {"Rota", "Durak_Sirasi", "Calisan_ID"}
+    if not required_stops.issubset(stops.columns) or not required_assignments.issubset(assignments.columns):
+        raise ValueError("Önceki rota sonuç dosyasının gerekli sayfa veya sütunları eksik.")
+
+    current_keys = [normalize_employee_id(value) for value in employees["Calisan_ID"]]
+    if any(not key for key in current_keys):
+        raise ValueError("Mevcut rotayı korumak için her çalışanın sicil/ID bilgisi dolu olmalıdır.")
+    if len(set(current_keys)) != len(current_keys):
+        raise ValueError("Mevcut rotayı korumak için çalışan sicil/ID değerleri benzersiz olmalıdır.")
+    employee_by_key = {key: index for index, key in enumerate(current_keys)}
+
+    members_by_stop: dict[tuple[int, int], list[int]] = {}
+    for _, row in assignments.iterrows():
+        key = normalize_employee_id(row["Calisan_ID"])
+        if key not in employee_by_key:
+            continue
+        stop_key = (route_number(row["Rota"]), int(row["Durak_Sirasi"]))
+        members_by_stop.setdefault(stop_key, []).append(employee_by_key[key])
+
+    route_map: dict[int, list[CommonStop]] = {}
+    ordered_stops = stops.sort_values(["Rota", "Durak_Sirasi"], kind="stable")
+    for _, row in ordered_stops.iterrows():
+        lat = pd.to_numeric(row["Enlem"], errors="coerce")
+        lon = pd.to_numeric(row["Boylam"], errors="coerce")
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        number = route_number(row["Rota"])
+        order = int(row["Durak_Sirasi"])
+        members = list(dict.fromkeys(members_by_stop.get((number, order), [])))
+        route_map.setdefault(number, []).append(
+            CommonStop(
+                anchor_index=order - 1,
+                member_indices=members,
+                walking_distances_m=[0.0] * len(members),
+                latitude=float(lat),
+                longitude=float(lon),
+                label=str(row["Durak_Adi"]).strip(),
+                source=(
+                    str(row["Durak_Kaynagi"]).strip()
+                    if "Durak_Kaynagi" in row and not pd.isna(row["Durak_Kaynagi"])
+                    else "Önceki plan"
+                ),
+            )
+        )
+    if not route_map:
+        raise ValueError("Önceki plan dosyasında geçerli rota durağı bulunamadı.")
+    return [route_map[number] for number in sorted(route_map)]
+
+
+def materialize_shared_routes(
+    allocated_routes: list[list[CommonStop]],
+    duration_matrix: list[list[float]],
+    distance_matrix: list[list[float]],
+    direction: str,
+    wait_seconds_per_stop: int,
+) -> list[dict]:
+    """Ortak durak nesnelerini arayüz ve Excel çıktısının kullandığı yapıya çevirir."""
+    shared_routes = []
+    for vehicle_no, allocated_stops in enumerate(allocated_routes, start=1):
+        stops = []
+        for stop in allocated_stops:
+            members = list(stop.member_indices)
+            walk_by_employee = {
+                employee_index: distance
+                for employee_index, distance in zip(stop.member_indices, stop.walking_distances_m)
+            }
+            stops.append(
+                {
+                    "anchor_matrix_index": stop.matrix_index,
+                    "latitude": float(stop.latitude),
+                    "longitude": float(stop.longitude),
+                    "label": stop.label,
+                    "source": stop.source,
+                    "member_indices": members,
+                    "walk_by_employee": walk_by_employee,
+                    "passenger_count": len(members),
+                    "max_walk_m": stop.max_walk_m,
+                    "average_walk_m": stop.average_walk_m,
+                }
+            )
+
+        ordered_matrix_indices = [stop["anchor_matrix_index"] for stop in stops]
+        path_indices = [*ordered_matrix_indices, 0] if direction == "morning" else [0, *ordered_matrix_indices]
+        drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
+        distance_meters = sum(distance_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
+        all_walks = [
+            distance
+            for stop in stops
+            for distance in stop["walk_by_employee"].values()
+        ]
+        shared_routes.append(
+            {
+                "vehicle_no": vehicle_no,
+                "occupancy": sum(stop["passenger_count"] for stop in stops),
+                "stops": stops,
+                "path_indices": path_indices,
+                "distance_km": distance_meters / 1000,
+                "drive_minutes": drive_seconds / 60,
+                "wait_minutes": len(stops) * wait_seconds_per_stop / 60,
+                "total_minutes": drive_seconds / 60 + len(stops) * wait_seconds_per_stop / 60,
+                "average_walk_m": sum(all_walks) / len(all_walks) if all_walks else 0,
+                "max_walk_m": max(all_walks, default=0),
+            }
+        )
+    return shared_routes
 
 
 def build_shared_routes(
@@ -182,6 +347,7 @@ def build_shared_routes(
     max_route_minutes: int,
     use_road_network: bool,
     approved_candidates: list[tuple[float, float, str]],
+    allow_automatic_candidates: bool,
 ):
     """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
@@ -190,6 +356,7 @@ def build_shared_routes(
         max_walk_m=max_walk_m,
         walking_factor=1.20,
         approved_candidates=approved_candidates,
+        allow_automatic_candidates=allow_automatic_candidates,
     )
     all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
         employee_coordinates,
@@ -247,57 +414,16 @@ def build_shared_routes(
             "Azami rota süresini artırın veya kapasiteyi kontrol edin."
         ) from last_error
 
-    shared_routes = []
-    for vehicle_no, allocated_stops in enumerate(allocated_routes, start=1):
-        stops = []
-        for stop in allocated_stops:
-            members = list(stop.member_indices)
-            walk_by_employee = {
-                employee_index: distance
-                for employee_index, distance in zip(stop.member_indices, stop.walking_distances_m)
-            }
-            stops.append(
-                {
-                    "anchor_matrix_index": stop.matrix_index,
-                    "latitude": float(stop.latitude),
-                    "longitude": float(stop.longitude),
-                    "label": stop.label,
-                    "source": stop.source,
-                    "member_indices": members,
-                    "walk_by_employee": walk_by_employee,
-                    "passenger_count": len(members),
-                    "max_walk_m": stop.max_walk_m,
-                    "average_walk_m": stop.average_walk_m,
-                }
-            )
-
-        ordered_stops = stops
-        ordered_matrix_indices = [stop["anchor_matrix_index"] for stop in ordered_stops]
-        path_indices = [*ordered_matrix_indices, 0] if direction == "morning" else [0, *ordered_matrix_indices]
-        drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
-        distance_meters = sum(distance_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
-        all_walks = [
-            distance
-            for stop in ordered_stops
-            for distance in stop["walk_by_employee"].values()
-        ]
-        shared_routes.append(
-            {
-                "vehicle_no": vehicle_no,
-                "occupancy": sum(stop["passenger_count"] for stop in ordered_stops),
-                "stops": ordered_stops,
-                "path_indices": path_indices,
-                "distance_km": distance_meters / 1000,
-                "drive_minutes": drive_seconds / 60,
-                "wait_minutes": len(ordered_stops) * wait_seconds_per_stop / 60,
-                "total_minutes": drive_seconds / 60 + len(ordered_stops) * wait_seconds_per_stop / 60,
-                "average_walk_m": sum(all_walks) / len(all_walks) if all_walks else 0,
-                "max_walk_m": max(all_walks, default=0),
-            }
-        )
-    if any(stop.source == "Otomatik ortak nokta" for stop in all_stops):
+    shared_routes = materialize_shared_routes(
+        allocated_routes,
+        duration_matrix,
+        distance_matrix,
+        direction,
+        wait_seconds_per_stop,
+    )
+    if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
         warnings.append(
-            "Otomatik ortak noktalar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
+            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
         )
     meta = {
         "vehicle_count": vehicle_count,
@@ -307,7 +433,50 @@ def build_shared_routes(
         "selected_stop_count": len(all_stops),
         "matrix_source": matrix_source,
         "warnings": warnings,
+        "planning_mode": "full",
     }
+    return shared_routes, meta
+
+
+def build_incremental_shared_routes(
+    employees: pd.DataFrame,
+    baseline_routes: list[list[CommonStop]],
+    factory_coordinates: tuple[float, float],
+    max_walk_m: int,
+    target_average_walk_m: int,
+    direction: str,
+    capacity: int,
+    mode: str,
+    wait_seconds_per_stop: int,
+    max_route_minutes: int,
+    use_road_network: bool,
+    approved_candidates: list[tuple[float, float, str]],
+    allow_automatic_candidates: bool,
+):
+    employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
+    allocated_routes, duration_matrix, distance_matrix, meta = update_routes_incrementally(
+        employee_coordinates=employee_coordinates,
+        baseline_routes=baseline_routes,
+        factory_coordinates=factory_coordinates,
+        approved_candidates=approved_candidates,
+        max_walk_m=max_walk_m,
+        target_average_walk_m=target_average_walk_m,
+        walking_factor=1.20,
+        capacity=capacity,
+        direction=direction,
+        wait_seconds_per_stop=wait_seconds_per_stop,
+        max_route_minutes=max_route_minutes,
+        mode=mode,
+        use_road_network=use_road_network,
+        allow_automatic_candidates=allow_automatic_candidates,
+    )
+    shared_routes = materialize_shared_routes(
+        allocated_routes,
+        duration_matrix,
+        distance_matrix,
+        direction,
+        wait_seconds_per_stop,
+    )
     return shared_routes, meta
 
 
@@ -391,10 +560,29 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
 
 with st.sidebar:
     st.header("Planlama ayarları")
+    planning_label = st.radio(
+        "Planlama yaklaşımı",
+        ["Tam optimizasyon", "Mevcut planı koruyarak güncelle"],
+        help=(
+            "Tam optimizasyon bütün planı yeniden kurar. Mevcut planı koruma modu "
+            "önce yeni çalışanı mevcut durağa ekler ve yalnızca gerekirse yeni durak/rota açar."
+        ),
+    )
     mode_label = st.radio(
         "Rota sayısı",
         ["Sabit 3 servis", "Otomatik (kapasite + süreye göre)"],
         index=1,
+    )
+    stop_policy_label = st.radio(
+        "Durak adayı politikası",
+        [
+            "Yüklenen durakları kullan; gerekirse yeni aday öner",
+            "Yalnızca yüklenen durakları kullan",
+        ],
+        help=(
+            "Yeni aday seçeneği çalışan evleri ve yakın evlerin orta noktalarını da değerlendirir. "
+            "Bu noktalar saha onayı olmadan kesin durak değildir."
+        ),
     )
     capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=40, step=1)
     max_walk_m = st.slider(
@@ -444,12 +632,31 @@ with st.sidebar:
         "Sürüş ve durak beklemeleri birlikte sınırlandırılır."
     )
 
+allow_automatic_candidates = not stop_policy_label.startswith("Yalnızca")
 uploaded = st.file_uploader("Koordinatlı çalışan Excel'ini yükleyin", type=["xlsx", "xls"])
 approved_stop_file = st.file_uploader(
-    "Onaylı aday durak Excel'i (isteğe bağlı)",
+    "Mevcut / aday durak Excel'i (önerilir)",
     type=["xlsx", "xls"],
-    help="Varsa Durak_Adi, Enlem ve Boylam sütunlarını içeren saha tarafından onaylanmış noktaları yükleyin.",
+    help=(
+        "Durak_Adi, Enlem ve Boylam sütunlarını içeren dosyadır. Saha_Onayi sütununda "
+        "Uygun Değil/Reddedildi olan satırlar kullanılmaz; Bekliyor olanlar yalnızca adaydır."
+    ),
 )
+previous_plan_file = None
+if planning_label.startswith("Mevcut"):
+    previous_plan_file = st.file_uploader(
+        "Önceki rota sonuç Excel'i",
+        type=["xlsx"],
+        help=(
+            "Bir önceki çalıştırmada `Rota sonuçlarını Excel olarak indir` düğmesiyle "
+            "kaydettiğiniz servis_rota_sonuclari.xlsx dosyasıdır."
+        ),
+    )
+    if previous_plan_file is None and st.session_state.get("last_plan_bytes") is None:
+        st.info(
+            "İlk kez kullanıyorsanız önce Tam optimizasyonu çalıştırıp sonucu indirin. "
+            "Sonraki çalışan güncellemelerinde bu modu seçin."
+        )
 
 if uploaded is None:
     st.info("Başlamak için `Enlem` ve `Boylam` sütunları dolu olan Excel dosyanızı yükleyin.")
@@ -457,11 +664,20 @@ if uploaded is None:
 
 raw_bytes = uploaded.getvalue()
 approved_bytes = approved_stop_file.getvalue() if approved_stop_file is not None else b""
-file_key = hashlib.sha256(raw_bytes + approved_bytes).hexdigest()
+previous_bytes = previous_plan_file.getvalue() if previous_plan_file is not None else b""
+file_key = hashlib.sha256(
+    raw_bytes
+    + approved_bytes
+    + previous_bytes
+    + planning_label.encode("utf-8")
+    + stop_policy_label.encode("utf-8")
+).hexdigest()
 if st.session_state.get("file_key") != file_key:
     try:
         st.session_state["raw_df"] = pd.read_excel(BytesIO(raw_bytes))
-        st.session_state["approved_candidates"] = read_approved_candidates(approved_stop_file)
+        approved_candidates, approved_stats = read_approved_candidates(approved_stop_file)
+        st.session_state["approved_candidates"] = approved_candidates
+        st.session_state["approved_candidate_stats"] = approved_stats
         st.session_state["file_key"] = file_key
         st.session_state.pop("result", None)
         st.session_state.pop("shared_routes", None)
@@ -487,6 +703,19 @@ c1, c2, c3 = st.columns(3)
 c1.metric("Aktif servis kullanıcısı", len(employees))
 c2.metric("Eksik çalışan koordinatı", int(employees[["Enlem", "Boylam"]].isna().any(axis=1).sum()))
 c3.metric("Minimum servis", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
+approved_count = len(st.session_state.get("approved_candidates", []))
+if approved_count:
+    candidate_stats = st.session_state.get("approved_candidate_stats", {})
+    st.caption(
+        f"{approved_count} yüklenmiş durak bulundu: "
+        f"{candidate_stats.get('approved', 0)} saha onaylı, "
+        f"{candidate_stats.get('pending', approved_count)} onay bekliyor. "
+        + (
+            "Bunlara ek olarak gerektiğinde otomatik/adres tabanlı adaylar da değerlendirilecek."
+            if allow_automatic_candidates
+            else "Bu çalıştırmada bu listenin dışına yeni durak eklenmeyecek."
+        )
+    )
 
 with st.expander("Yüklenen veriyi göster", expanded=False):
     st.dataframe(working, width="stretch", hide_index=True)
@@ -520,27 +749,53 @@ else:
 
 ready = not employees.empty and employees[["Enlem", "Boylam"]].notna().all(axis=1).all()
 road_ready = not use_road_network or road_consent
+incremental_mode = planning_label.startswith("Mevcut")
+previous_plan_source = previous_plan_file or st.session_state.get("last_plan_bytes")
+incremental_ready = not incremental_mode or (
+    previous_plan_source is not None and mapping["id"] is not None
+)
+approved_ready = allow_automatic_candidates or bool(
+    st.session_state.get("approved_candidates", [])
+)
 st.subheader("2. Rotaları oluştur")
 if use_road_network and not road_consent:
     st.info("Gerçek yol güzergâhı için sol menüdeki koordinat paylaşım onayını işaretleyin.")
-if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready or not road_ready):
+if incremental_mode and mapping["id"] is None:
+    st.error("Mevcut planı korumak için çalışan Excel'inde benzersiz bir sicil/ID sütunu seçilmelidir.")
+if not approved_ready:
+    st.error("Yalnızca yüklenen duraklar modunda mevcut/adayı durak Excel'i yüklenmelidir.")
+button_label = "Mevcut planı güncelle" if incremental_mode else "Optimizasyonu çalıştır"
+if st.button(
+    button_label,
+    type="primary",
+    disabled=not ready or not road_ready or not incremental_ready or not approved_ready,
+):
     with st.spinner("Ortak duraklar seçiliyor ve rotalar birlikte optimize ediliyor..."):
         try:
             mode = "fixed" if mode_label.startswith("Sabit") else "auto"
             direction = "morning" if direction_label.startswith("Sabah") else "evening"
-            shared_routes, result_meta = build_shared_routes(
-                employees=employees,
-                factory_coordinates=(factory_lat, factory_lon),
-                max_walk_m=int(max_walk_m),
-                target_average_walk_m=min(int(target_average_walk_m), int(max_walk_m)),
-                direction=direction,
-                capacity=int(capacity),
-                mode=mode,
-                wait_seconds_per_stop=int(wait_seconds_per_stop),
-                max_route_minutes=int(max_route_minutes),
-                use_road_network=bool(use_road_network),
-                approved_candidates=st.session_state.get("approved_candidates", []),
-            )
+            common_arguments = {
+                "employees": employees,
+                "factory_coordinates": (factory_lat, factory_lon),
+                "max_walk_m": int(max_walk_m),
+                "target_average_walk_m": min(int(target_average_walk_m), int(max_walk_m)),
+                "direction": direction,
+                "capacity": int(capacity),
+                "mode": mode,
+                "wait_seconds_per_stop": int(wait_seconds_per_stop),
+                "max_route_minutes": int(max_route_minutes),
+                "use_road_network": bool(use_road_network),
+                "approved_candidates": st.session_state.get("approved_candidates", []),
+                "allow_automatic_candidates": allow_automatic_candidates,
+            }
+            if incremental_mode:
+                baseline_routes = read_previous_routes(previous_plan_source, employees)
+                shared_routes, result_meta = build_incremental_shared_routes(
+                    baseline_routes=baseline_routes,
+                    **common_arguments,
+                )
+            else:
+                shared_routes, result_meta = build_shared_routes(**common_arguments)
             st.session_state["result"] = result_meta
             st.session_state["shared_routes"] = shared_routes
             st.session_state["result_employees"] = employees.copy()
@@ -554,6 +809,8 @@ if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready or
             st.session_state["result_wait_seconds"] = int(wait_seconds_per_stop)
             st.session_state["result_max_route_minutes"] = int(max_route_minutes)
             st.session_state["result_mode"] = mode
+            st.session_state["result_planning_mode"] = "incremental" if incremental_mode else "full"
+            st.session_state["result_allow_automatic_candidates"] = allow_automatic_candidates
         except Exception as exc:
             st.session_state.pop("result", None)
             st.session_state.pop("shared_routes", None)
@@ -606,12 +863,17 @@ longest_route = max((route["total_minutes"] for route in nonempty_routes), defau
 r1, r2, r3, r4, r5, r6 = st.columns(6)
 r1.metric("Önerilen servis", optimized_vehicle_count)
 r2.metric("Toplam çalışan", len(employees))
-r3.metric("Aday durak", result["candidate_count"])
-r4.metric(
-    "Kanıtlı minimum durak" if result["minimum_proven"] else "En iyi bulunan alt plan",
-    result["minimum_stop_count"],
-)
-r5.metric("Seçilen durak", total_stop_count)
+if result.get("planning_mode") == "incremental":
+    r3.metric("Eşleşmesi korunan", result.get("preserved_employee_count", 0))
+    r4.metric("Mevcut durağa eklenen", result.get("added_to_existing_count", 0))
+    r5.metric("Yeni durak", result.get("new_stop_count", 0))
+else:
+    r3.metric("Aday durak", result["candidate_count"])
+    r4.metric(
+        "Kanıtlı minimum durak" if result["minimum_proven"] else "En iyi bulunan alt plan",
+        result["minimum_stop_count"],
+    )
+    r5.metric("Seçilen durak", total_stop_count)
 r6.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
 s1, s2, s3, s4, s5, s6 = st.columns(6)
 s1.metric("Çoklu ortak durak", multi_stop_count)
@@ -620,15 +882,27 @@ s3.metric("Ortalama yürüme", f"{average_walk:.0f} m")
 s4.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
 s5.metric("Toplam mesafe", f"{total_distance:.1f} km")
 s6.metric("En uzun rota", f"{longest_route:.0f} dk")
-st.caption(
-    "Yöntem: durak seçimi içeren okul/personel servisi rotalama (SBRP-BSS). "
-    f"Önce {result_max_walk_m} m azami yürüyüşle "
-    f"{'kanıtlı minimum' if result['minimum_proven'] else 'süre sınırında bulunan en iyi'} durak planı kuruldu; "
-    f"ardından ortalama yürüyüşü {result_target_average_walk_m} m hedefine yaklaştırmak için durak eklendi. "
-    "Tahmini yürüyüş, kuş uçuşu mesafeye %20 yol sapması eklenerek hesaplandı. "
-    f"Durak başına {result_wait_seconds} sn bekleme ve {result_max_route_minutes} dk toplam rota sınırı kullanıldı. "
-    "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
-)
+if result.get("planning_mode") == "incremental":
+    st.success(
+        f"Mevcut plan korundu: {result.get('preserved_employee_count', 0)} çalışan eski durağında kaldı; "
+        f"{result.get('added_to_existing_count', 0)} yeni/adresi değişen çalışan mevcut durağa eklendi; "
+        f"{result.get('new_stop_count', 0)} yeni durak ve {result.get('added_route_count', 0)} yeni rota açıldı."
+    )
+    st.caption(
+        f"Artımlı güncelleme: önceki duraklar ve sıraları korunarak {result_max_walk_m} m yürüme, "
+        f"{result_capacity} kişi kapasite, durak başına {result_wait_seconds} sn bekleme ve "
+        f"{result_max_route_minutes} dk rota sınırı uygulandı. Yeni otomatik noktalar saha onayı gerektirir."
+    )
+else:
+    st.caption(
+        "Yöntem: durak seçimi içeren okul/personel servisi rotalama (SBRP-BSS). "
+        f"Önce {result_max_walk_m} m azami yürüyüşle "
+        f"{'kanıtlı minimum' if result['minimum_proven'] else 'süre sınırında bulunan en iyi'} durak planı kuruldu; "
+        f"ardından ortalama yürüyüşü {result_target_average_walk_m} m hedefine yaklaştırmak için durak eklendi. "
+        "Tahmini yürüyüş, kuş uçuşu mesafeye %20 yol sapması eklenerek hesaplandı. "
+        f"Durak başına {result_wait_seconds} sn bekleme ve {result_max_route_minutes} dk toplam rota sınırı kullanıldı. "
+        "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
+    )
 
 palette = [
     [40, 90, 132], [213, 94, 0], [0, 140, 120], [163, 75, 148],
@@ -767,6 +1041,7 @@ for route in nonempty_routes:
         st.dataframe(pd.DataFrame(stop_rows), width="stretch", hide_index=True)
 
 export_bytes = result_workbook(shared_routes, employees, result_capacity)
+st.session_state["last_plan_bytes"] = export_bytes
 st.download_button(
     "📥 Rota sonuçlarını Excel olarak indir",
     data=export_bytes,

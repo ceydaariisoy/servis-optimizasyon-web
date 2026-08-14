@@ -1,8 +1,8 @@
 """Servis rota planlama motoru.
 
-Harici bir optimizasyon paketi gerektirmeden, kapasite kısıtlı ve coğrafi olarak
-tutarlı taslak rotalar üretir. Yol süreleri için önce OSRM denenir; servis
-erişilemezse kuş uçuşu mesafe tabanlı tahmine otomatik geçilir.
+OR-Tools ile ortak durak seçimi ve kapasite kısıtlı rota optimizasyonu yapar.
+Yol süreleri için önce OSRM denenir; servis erişilemezse kuş uçuşu mesafe
+tabanlı tahmine otomatik geçilir.
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 from zipfile import ZipFile
+
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from ortools.sat.python import cp_model
 
 
 EARTH_RADIUS_KM = 6371.0088
@@ -81,59 +84,100 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def cluster_common_stops(
-    coordinates: Sequence[tuple[float, float]], max_walk_m: float = 500.0
+    coordinates: Sequence[tuple[float, float]],
+    max_walk_m: float = 500.0,
+    capacity: int | None = None,
+    walking_factor: float = 1.20,
+    time_limit_seconds: int = 15,
 ) -> list[CommonStop]:
-    """Çalışanları azami kuş uçuşu yürüme sınırıyla ortak duraklarda toplar.
+    """Ortak durakları tam sayılı set-cover modeliyle seçer.
 
-    Duraklar rastgele bir ortalama noktaya değil, çalışan koordinatlarından birine
-    yerleştirilir. Böylece önerilen noktanın bina/yol dışına düşmesi engellenir.
-    Her turda henüz atanmamış en fazla çalışanı kapsayan aday seçilir.
+    Aday duraklar çalışan koordinatlarıdır. Kuş uçuşu mesafe, şehir içindeki yol
+    sapmalarını ihtiyatlı biçimde temsil etmek için ``walking_factor`` ile
+    büyütülür. Amaç önce durak sayısını, sonra toplam tahmini yürüyüşü azaltır.
+    Böylece önceki açgözlü yöntemin gereksiz durak üretme riski ortadan kalkar.
     """
     if max_walk_m < 0:
         raise ValueError("Azami yürüme mesafesi negatif olamaz.")
+    if walking_factor < 1:
+        raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
     if not coordinates:
         return []
 
     count = len(coordinates)
+    max_stop_load = capacity or count
+    if max_stop_load <= 0:
+        raise ValueError("Durak kapasitesi sıfırdan büyük olmalıdır.")
     distances_m = [
-        [haversine_km(coordinates[i], coordinates[j]) * 1000 for j in range(count)]
+        [
+            haversine_km(coordinates[i], coordinates[j]) * 1000 * walking_factor
+            for j in range(count)
+        ]
         for i in range(count)
     ]
-    unassigned = set(range(count))
+
+    model = cp_model.CpModel()
+    selected = [model.new_bool_var(f"stop_{anchor}") for anchor in range(count)]
+    assignments: dict[tuple[int, int], cp_model.IntVar] = {}
+    by_employee: list[list[cp_model.IntVar]] = [[] for _ in range(count)]
+    by_anchor: list[list[cp_model.IntVar]] = [[] for _ in range(count)]
+
+    for anchor in range(count):
+        for employee in range(count):
+            if distances_m[anchor][employee] <= max_walk_m + 1e-9:
+                variable = model.new_bool_var(f"assign_{anchor}_{employee}")
+                assignments[(anchor, employee)] = variable
+                by_employee[employee].append(variable)
+                by_anchor[anchor].append(variable)
+                model.add(variable <= selected[anchor])
+
+    for employee, variables in enumerate(by_employee):
+        if not variables:
+            raise ValueError(f"{employee + 1}. çalışan için erişilebilir ortak durak bulunamadı.")
+        model.add(sum(variables) == 1)
+
+    for anchor, variables in enumerate(by_anchor):
+        model.add(sum(variables) <= max_stop_load * selected[anchor])
+        model.add(selected[anchor] <= sum(variables))
+
+    # Bir durak eksilmesi, toplam yürüyüşteki olası tüm iyileşmelerden daha değerlidir.
+    stop_priority = int(math.ceil(count * max_walk_m)) + 1
+    walking_cost = sum(
+        int(round(distances_m[anchor][employee])) * variable
+        for (anchor, employee), variable in assignments.items()
+    )
+    model.minimize(stop_priority * sum(selected) + walking_cost)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
+    # Streamlit'in sınırlı Linux konteynerlerinde çok iş parçacıklı CP-SAT bazı
+    # sürümlerde kararsızlaşabildiği için tek iş parçacığı kullanılır.
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 42
+    status = solver.solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise ValueError("Ortak durak optimizasyonu için uygulanabilir çözüm bulunamadı.")
+
     stops: list[CommonStop] = []
-
-    while unassigned:
-        # Eşit kapsamada toplam yürüyüşü daha kısa, sonra sıra numarası küçük aday seçilir.
-        candidates: list[tuple[int, float, int, list[int]]] = []
-        for anchor in sorted(unassigned):
-            members = [
-                index
-                for index in sorted(unassigned)
-                if distances_m[anchor][index] <= max_walk_m + 1e-9
-            ]
-            candidates.append((-len(members), sum(distances_m[anchor][i] for i in members), anchor, members))
-        _, _, anchor, members = min(candidates)
-
-        # Aynı grubu kapsayabilen üyeler arasından toplam yürüyüşü en kısa medoid'i seç.
-        feasible_anchors = [
-            candidate
-            for candidate in members
-            if all(distances_m[candidate][member] <= max_walk_m + 1e-9 for member in members)
-        ]
-        if feasible_anchors:
-            anchor = min(
-                feasible_anchors,
-                key=lambda candidate: (
-                    sum(distances_m[candidate][member] for member in members),
-                    candidate,
-                ),
+    for anchor in range(count):
+        if not solver.value(selected[anchor]):
+            continue
+        members = sorted(
+            (
+                employee
+                for employee in range(count)
+                if (anchor, employee) in assignments
+                and solver.value(assignments[(anchor, employee)])
+            ),
+            key=lambda employee: (distances_m[anchor][employee], employee),
+        )
+        stops.append(
+            CommonStop(
+                anchor_index=anchor,
+                member_indices=members,
+                walking_distances_m=[distances_m[anchor][employee] for employee in members],
             )
-
-        members = sorted(members, key=lambda index: (distances_m[anchor][index], index))
-        walking = [distances_m[anchor][index] for index in members]
-        stops.append(CommonStop(anchor, members, walking))
-        unassigned.difference_update(members)
-
+        )
     return stops
 
 
@@ -511,48 +555,105 @@ def assign_common_stops_to_routes(
     capacity: int,
     duration_matrix: Sequence[Sequence[float]],
     direction: str = "morning",
+    wait_seconds_per_stop: int = 45,
+    max_route_minutes: float = 0,
+    time_limit_seconds: int = 10,
 ) -> list[list[CommonStop]]:
-    """Ortak durakları coğrafi bütünlük ve araç kapasitesiyle servis rotalarına dağıtır.
+    """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
-    ``coordinates`` dizisinin ilk noktası fabrika, devamı çalışan koordinatlarıdır.
-    ``CommonStop.anchor_index`` ise çalışan dizisindeki sıfır tabanlı konumdur.
+    Model, durakları araçlara atama ve her aracın durak sırasını aynı anda çözer.
+    Sabah rotaları serbest bir ilk duraktan başlayıp fabrikada, akşam rotaları
+    fabrikada başlayıp serbest bir son durakta biter.
     """
+    if direction not in {"morning", "evening"}:
+        raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+    if vehicle_count <= 0:
+        raise ValueError("Araç sayısı en az 1 olmalıdır.")
+    if capacity <= 0:
+        raise ValueError("Araç kapasitesi sıfırdan büyük olmalıdır.")
     employee_count = sum(stop.passenger_count for stop in stops)
-    target_loads = _balanced_sizes(employee_count, vehicle_count, capacity)
+    if employee_count > vehicle_count * capacity:
+        raise ValueError(
+            f"Kapasite yetersiz: {employee_count} çalışan için en az "
+            f"{math.ceil(employee_count / capacity)} araç gerekir."
+        )
     if not stops:
         return [[] for _ in range(vehicle_count)]
 
-    depot_lat, depot_lon = coordinates[0]
-    angular_order = sorted(
-        range(len(stops)),
-        key=lambda stop_index: math.atan2(
-            coordinates[stops[stop_index].anchor_index + 1][0] - depot_lat,
-            coordinates[stops[stop_index].anchor_index + 1][1] - depot_lon,
-        ),
+    if any(stop.passenger_count > capacity for stop in stops):
+        raise ValueError("Bir ortak durağın yolcu sayısı araç kapasitesini aşıyor.")
+
+    # Yerel düğümler: 0=fabrika, 1..N=ortak durak, son düğüm=serbest başlangıç/bitiş.
+    stop_matrix_indices = [stop.anchor_index + 1 for stop in stops]
+    dummy_node = len(stops) + 1
+    node_count = dummy_node + 1
+    starts = [dummy_node] * vehicle_count if direction == "morning" else [0] * vehicle_count
+    ends = [0] * vehicle_count if direction == "morning" else [dummy_node] * vehicle_count
+    manager = pywrapcp.RoutingIndexManager(node_count, vehicle_count, starts, ends)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def full_matrix_index(local_node: int) -> int | None:
+        if local_node == 0:
+            return 0
+        if 1 <= local_node <= len(stops):
+            return stop_matrix_indices[local_node - 1]
+        return None
+
+    def travel_seconds(from_index: int, to_index: int) -> int:
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        from_full = full_matrix_index(from_node)
+        to_full = full_matrix_index(to_node)
+        drive = 0.0 if from_full is None or to_full is None else duration_matrix[from_full][to_full]
+        service = wait_seconds_per_stop if 1 <= from_node <= len(stops) else 0
+        return max(0, int(round(drive + service)))
+
+    transit_callback = routing.RegisterTransitCallback(travel_seconds)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback)
+
+    demands = [0, *(stop.passenger_count for stop in stops), 0]
+
+    def demand(from_index: int) -> int:
+        return demands[manager.IndexToNode(from_index)]
+
+    demand_callback = routing.RegisterUnaryTransitCallback(demand)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_callback,
+        0,
+        [capacity] * vehicle_count,
+        True,
+        "Capacity",
     )
-    step = 1 if len(angular_order) <= 60 else max(1, len(angular_order) // 30)
-    best_routes: list[list[CommonStop]] | None = None
-    best_score = math.inf
 
-    for rotation in range(0, len(angular_order), step):
-        rotated = angular_order[rotation:] + angular_order[:rotation]
-        allocated = _allocate_unsplit_common_stops(stops, rotated, target_loads)
-        if allocated is None:
-            allocated = _split_ordered_common_stops(stops, rotated, target_loads)
-        ordered_routes: list[list[CommonStop]] = []
-        costs = []
-        for route_stops in allocated:
-            stop_by_matrix_index = {stop.anchor_index + 1: stop for stop in route_stops}
-            ordered_indices = order_route_points(list(stop_by_matrix_index), duration_matrix, direction)
-            ordered_route = [stop_by_matrix_index[index] for index in ordered_indices]
-            ordered_routes.append(ordered_route)
-            costs.append(_path_cost(ordered_indices, duration_matrix, direction))
-        score = sum(costs) + ((max(costs) - min(costs)) * 0.10 if costs else 0.0)
-        if score < best_score:
-            best_score = score
-            best_routes = ordered_routes
+    horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
+    routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")
+    time_dimension = routing.GetDimensionOrDie("Time")
+    # Toplam süre yanında en uzun rotayı da kısaltarak araçlar arasında denge kurar.
+    time_dimension.SetGlobalSpanCostCoefficient(3)
 
-    return best_routes or [[] for _ in range(vehicle_count)]
+    parameters = pywrapcp.DefaultRoutingSearchParameters()
+    parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.time_limit.FromSeconds(max(1, time_limit_seconds))
+    parameters.log_search = False
+    solution = routing.SolveWithParameters(parameters)
+    if solution is None:
+        duration_text = f" ve {max_route_minutes:.0f} dakika sınırına" if max_route_minutes else ""
+        raise ValueError(
+            f"{vehicle_count} araç, kapasite{duration_text} göre uygulanabilir rota üretemedi."
+        )
+
+    routes: list[list[CommonStop]] = []
+    for vehicle_no in range(vehicle_count):
+        route: list[CommonStop] = []
+        index = routing.Start(vehicle_no)
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if 1 <= node <= len(stops):
+                route.append(stops[node - 1])
+            index = solution.Value(routing.NextVar(index))
+        routes.append(route)
+    return routes
 
 
 def _balanced_sizes(employee_count: int, vehicle_count: int, capacity: int) -> list[int]:

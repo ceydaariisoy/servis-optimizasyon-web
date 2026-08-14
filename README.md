@@ -5,14 +5,17 @@ Bilgisayara Python kurmak gerekmez; Streamlit Community Cloud üzerinde tarayıc
 
 ## Özellikler
 
-- Mevcut **3 servis** veya **otomatik minimum servis sayısı** seçimi
+- Mevcut **3 servis** veya kapasite ve azami süreye göre **otomatik servis sayısı** seçimi
 - Tüm araçlar için ortak kapasite sınırı
+- OR-Tools ile mümkün olan en az ortak durak sayısı ve toplam yürüyüş optimizasyonu
+- Durak talebi, araç kapasitesi, gerçek yol süresi ve rota sırasını birlikte çözen araç rotalama modeli
+- Ayarlanabilir azami rota süresi ve durak başına bekleme süresi
 - Sabah (çalışan → fabrika) ve akşam (fabrika → çalışan) yönü
 - Aktif olmayan veya servis kullanmayan çalışanları dışarıda bırakma
 - Yeni çalışan eklendiğinde ya da çalışan ayrıldığında güncel Excel ile yeniden hesaplama
 - Eksik koordinatları ücretsiz Nominatim servisiyle tamamlama; API anahtarı gerekmez
 - OSRM yol süreleri; erişim olmazsa yaklaşık mesafeye otomatik geçiş
-- Harita, rota sırası, süre, mesafe, doluluk ve Excel sonuç indirme
+- Harita, rota sırası, sürüş/toplam süre, mesafe, doluluk, tekil/ortak durak ve Excel sonuç indirme
 
 ## İnternette yayınlama
 
@@ -44,7 +47,7 @@ değiştirilmelidir.
 
 ## Önemli not
 
-Bu çıktı operasyonel karar için bir **taslak rota planıdır**. Servis başlamadan önce yol yasakları,
-tek yönler, gerçek durak güvenliği, vardiya saati ve trafik koşulları operasyon ekibi tarafından
-kontrol edilmelidir.
-
+Yürüyüş mesafesi, kuş uçuşu mesafeye şehir içi sapmaları temsil eden %20 güvenlik payı
+eklenerek tahmin edilir. Bu çıktı güçlü bir optimizasyon planıdır; yine de servis başlamadan önce
+yol yasakları, gerçek durak güvenliği, kaldırım/yaya geçidi, vardiya saati ve trafik koşulları
+operasyon ekibi tarafından kontrol edilmelidir.

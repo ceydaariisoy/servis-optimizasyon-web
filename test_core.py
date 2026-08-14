@@ -1,6 +1,12 @@
 import unittest
 
-from core import plan_routes
+from core import (
+    CommonStop,
+    assign_common_stops_to_routes,
+    build_estimated_matrices,
+    cluster_common_stops,
+    plan_routes,
+)
 
 
 class RoutePlannerTests(unittest.TestCase):
@@ -32,7 +38,55 @@ class RoutePlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "en az 3 araç"):
             plan_routes(self.coords, capacity=2, mode="fixed", fixed_vehicle_count=2, use_road_network=False)
 
+    def test_common_stop_model_minimizes_stop_count_and_assigns_once(self):
+        close_coordinates = [
+            (39.77600, 30.52000),
+            (39.77630, 30.52025),
+            (39.77575, 30.52035),
+            (39.77615, 30.51970),
+        ]
+        stops = cluster_common_stops(
+            close_coordinates,
+            max_walk_m=500,
+            capacity=10,
+            time_limit_seconds=2,
+        )
+        assigned = [employee for stop in stops for employee in stop.member_indices]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(sorted(assigned), list(range(len(close_coordinates))))
+        self.assertLessEqual(stops[0].max_walk_m, 500)
+
+    def test_ortools_routes_respect_capacity_without_splitting_stops(self):
+        employee_coordinates = [
+            (39.7820, 30.5050),
+            (39.7822, 30.5052),
+            (39.7850, 30.4730),
+            (39.7852, 30.4732),
+            (39.7641, 30.5233),
+            (39.7643, 30.5235),
+        ]
+        coordinates = [(39.7760, 30.5200), *employee_coordinates]
+        duration_matrix, _ = build_estimated_matrices(coordinates)
+        stops = [
+            CommonStop(0, [0, 1], [0, 25]),
+            CommonStop(2, [2, 3], [0, 25]),
+            CommonStop(4, [4, 5], [0, 25]),
+        ]
+        routes = assign_common_stops_to_routes(
+            stops,
+            coordinates,
+            vehicle_count=2,
+            capacity=4,
+            duration_matrix=duration_matrix,
+            direction="morning",
+            wait_seconds_per_stop=45,
+            max_route_minutes=120,
+            time_limit_seconds=2,
+        )
+        assigned_anchors = [stop.anchor_index for route in routes for stop in route]
+        self.assertEqual(sorted(assigned_anchors), [0, 2, 4])
+        self.assertTrue(all(sum(stop.passenger_count for stop in route) <= 4 for route in routes))
+
 
 if __name__ == "__main__":
     unittest.main()
-

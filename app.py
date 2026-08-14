@@ -12,7 +12,6 @@ from core import (
     assign_common_stops_to_routes,
     cluster_common_stops,
     fetch_osrm_geometry,
-    order_route_points,
     plan_routes,
 )
 
@@ -139,25 +138,64 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out
 
 
-def build_shared_routes(result, employees: pd.DataFrame, max_walk_m: int, direction: str):
-    """Önce ortak durakları kurar, sonra durakları kapasite sınırlı araçlara dağıtır."""
+def build_shared_routes(
+    result,
+    employees: pd.DataFrame,
+    factory_coordinates: tuple[float, float],
+    max_walk_m: int,
+    direction: str,
+    capacity: int,
+    mode: str,
+    wait_seconds_per_stop: int,
+    max_route_minutes: int,
+):
+    """En az ortak durağı kurar; durak ataması ve sırasını birlikte optimize eder."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
-    all_stops = cluster_common_stops(employee_coordinates, max_walk_m=max_walk_m)
-    coordinates = [
-        (math.nan, math.nan),
-        *employee_coordinates,
-    ]
-    # Fabrika koordinatı matrisin 0. satırında zaten bulunduğu için yalnızca açı hesabında
-    # gerçek depo değerine ihtiyaç var; matristen bağımsız koordinat listesini eşitliyoruz.
-    coordinates[0] = st.session_state["result_factory"][:2]
-    allocated_routes = assign_common_stops_to_routes(
-        all_stops,
-        coordinates,
-        result.vehicle_count,
-        st.session_state["result_capacity"],
-        result.duration_matrix,
-        direction,
+    all_stops = cluster_common_stops(
+        employee_coordinates,
+        max_walk_m=max_walk_m,
+        capacity=capacity,
+        walking_factor=1.20,
     )
+    coordinates = [factory_coordinates, *employee_coordinates]
+    minimum_vehicle_count = math.ceil(len(employees) / capacity)
+    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
+    if vehicle_count < minimum_vehicle_count:
+        raise ValueError(
+            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
+        )
+
+    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
+    # sağlanmıyorsa araç sayısı birer artırılır.
+    last_error: Exception | None = None
+    maximum_vehicle_count = max(
+        vehicle_count,
+        min(len(all_stops), minimum_vehicle_count + 5),
+    )
+    while vehicle_count <= maximum_vehicle_count:
+        try:
+            allocated_routes = assign_common_stops_to_routes(
+                all_stops,
+                coordinates,
+                vehicle_count,
+                capacity,
+                result.duration_matrix,
+                direction,
+                wait_seconds_per_stop=wait_seconds_per_stop,
+                max_route_minutes=max_route_minutes,
+            )
+            break
+        except ValueError as exc:
+            last_error = exc
+            if mode == "fixed":
+                raise
+            vehicle_count += 1
+    else:
+        raise ValueError(
+            "Kapasite ve rota süresi sınırlarını birlikte sağlayan çözüm bulunamadı. "
+            "Azami rota süresini artırın veya kapasiteyi kontrol edin."
+        ) from last_error
+
     shared_routes = []
     for vehicle_no, allocated_stops in enumerate(allocated_routes, start=1):
         stops = []
@@ -198,11 +236,13 @@ def build_shared_routes(result, employees: pd.DataFrame, max_walk_m: int, direct
                 "path_indices": path_indices,
                 "distance_km": distance_meters / 1000,
                 "drive_minutes": drive_seconds / 60,
+                "wait_minutes": len(ordered_stops) * wait_seconds_per_stop / 60,
+                "total_minutes": drive_seconds / 60 + len(ordered_stops) * wait_seconds_per_stop / 60,
                 "average_walk_m": sum(all_walks) / len(all_walks) if all_walks else 0,
                 "max_walk_m": max(all_walks, default=0),
             }
         )
-    return shared_routes
+    return shared_routes, vehicle_count
 
 
 def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> bytes:
@@ -216,9 +256,13 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                 "Yolcu": route["occupancy"],
                 "Kapasite": capacity,
                 "Doluluk_Orani": route["occupancy"] / capacity,
-                "Ortak_Durak_Sayisi": len(route["stops"]),
+                "Toplam_Durak_Sayisi": len(route["stops"]),
+                "Coklu_Ortak_Durak": sum(stop["passenger_count"] > 1 for stop in route["stops"]),
+                "Tekil_Durak": sum(stop["passenger_count"] == 1 for stop in route["stops"]),
                 "Mesafe_km": round(route["distance_km"], 1),
                 "Surus_Suresi_dk": round(route["drive_minutes"]),
+                "Bekleme_Suresi_dk": round(route["wait_minutes"]),
+                "Toplam_Sure_dk": round(route["total_minutes"]),
                 "Ort_Yurume_m": round(route["average_walk_m"]),
                 "En_Uzak_Yurume_m": round(route["max_walk_m"]),
             }
@@ -230,6 +274,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                     "Rota": f"Rota {route['vehicle_no']}",
                     "Durak_Sirasi": order,
                     "Durak_Adresi": anchor["Adres"],
+                    "Durak_Turu": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
                     "Yolcu_Sayisi": stop["passenger_count"],
                     "Enlem": anchor["Enlem"],
                     "Boylam": anchor["Boylam"],
@@ -273,7 +318,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
         writer.sheets["Rota_Ozeti"].set_column("D:D", 15, percent)
-        writer.sheets["Rota_Ozeti"].set_column("E:I", 18)
+        writer.sheets["Rota_Ozeti"].set_column("E:M", 18)
     return output.getvalue()
 
 
@@ -281,10 +326,10 @@ with st.sidebar:
     st.header("Planlama ayarları")
     mode_label = st.radio(
         "Rota sayısı",
-        ["Sabit 3 servis", "Otomatik (minimum)"],
+        ["Sabit 3 servis", "Otomatik (kapasite + süreye göre)"],
         index=1,
     )
-    capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=45, step=1)
+    capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=40, step=1)
     max_walk_m = st.slider(
         "Azami yürüme mesafesi (metre)",
         min_value=200,
@@ -292,6 +337,21 @@ with st.sidebar:
         value=500,
         step=50,
         help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
+    )
+    max_route_minutes = st.slider(
+        "Azami rota süresi (dakika)",
+        min_value=60,
+        max_value=180,
+        value=120,
+        step=5,
+        help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
+    )
+    wait_seconds_per_stop = st.number_input(
+        "Durak başına bekleme (saniye)",
+        min_value=0,
+        max_value=180,
+        value=45,
+        step=15,
     )
     direction_label = st.radio(
         "Sefer yönü",
@@ -304,7 +364,10 @@ with st.sidebar:
             "Koordinatların yol hesabı için açık OSRM servisine gönderilmesini onaylıyorum. "
             "İsim, sicil ve adres gönderilmez."
         )
-    st.caption("Mesai: 08.00–17.30 · Yakın çalışanlar ortak durakta buluşur · Bekleme süresi eklenmez.")
+    st.caption(
+        "Mesai: 08.00–17.30 · Yakın çalışanlar ortak durakta buluşur · "
+        "Sürüş ve durak beklemeleri birlikte sınırlandırılır."
+    )
 
 uploaded = st.file_uploader("Koordinatlı çalışan Excel'ini yükleyin", type=["xlsx", "xls"])
 
@@ -319,6 +382,7 @@ if st.session_state.get("file_key") != file_key:
         st.session_state["raw_df"] = pd.read_excel(BytesIO(raw_bytes))
         st.session_state["file_key"] = file_key
         st.session_state.pop("result", None)
+        st.session_state.pop("shared_routes", None)
     except Exception as exc:
         st.error(f"Excel dosyası okunamadı: {exc}")
         st.stop()
@@ -343,7 +407,7 @@ c2.metric("Eksik çalışan koordinatı", int(employees[["Enlem", "Boylam"]].isn
 c3.metric("Minimum servis", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
 
 with st.expander("Yüklenen veriyi göster", expanded=False):
-    st.dataframe(working, use_container_width=True, hide_index=True)
+    st.dataframe(working, width="stretch", hide_index=True)
 
 st.markdown("#### Fabrika bilgisi")
 if not factory_rows.empty and factory_rows[["Enlem", "Boylam"]].notna().all(axis=1).any():
@@ -391,13 +455,33 @@ if st.button("Optimizasyonu çalıştır", type="primary", disabled=not ready or
                 max_route_minutes=0,
                 use_road_network=bool(use_road_network),
             )
+            mode = "fixed" if mode_label.startswith("Sabit") else "auto"
+            direction = "morning" if direction_label.startswith("Sabah") else "evening"
+            shared_routes, optimized_vehicle_count = build_shared_routes(
+                result=result,
+                employees=employees,
+                factory_coordinates=(factory_lat, factory_lon),
+                max_walk_m=int(max_walk_m),
+                direction=direction,
+                capacity=int(capacity),
+                mode=mode,
+                wait_seconds_per_stop=int(wait_seconds_per_stop),
+                max_route_minutes=int(max_route_minutes),
+            )
             st.session_state["result"] = result
+            st.session_state["shared_routes"] = shared_routes
+            st.session_state["optimized_vehicle_count"] = optimized_vehicle_count
             st.session_state["result_employees"] = employees.copy()
             st.session_state["result_factory"] = (factory_lat, factory_lon, factory_address)
             st.session_state["result_direction"] = direction_label
             st.session_state["result_capacity"] = int(capacity)
             st.session_state["result_max_walk_m"] = int(max_walk_m)
+            st.session_state["result_wait_seconds"] = int(wait_seconds_per_stop)
+            st.session_state["result_max_route_minutes"] = int(max_route_minutes)
+            st.session_state["result_mode"] = mode
         except Exception as exc:
+            st.session_state.pop("result", None)
+            st.session_state.pop("shared_routes", None)
             st.error(str(exc))
 
 result = st.session_state.get("result")
@@ -412,7 +496,13 @@ result_direction = st.session_state["result_direction"]
 result_capacity = st.session_state["result_capacity"]
 result_max_walk_m = st.session_state.get("result_max_walk_m", 500)
 direction = "morning" if result_direction.startswith("Sabah") else "evening"
-shared_routes = build_shared_routes(result, employees, result_max_walk_m, direction)
+shared_routes = st.session_state.get("shared_routes")
+if shared_routes is None:
+    st.error("Rota sonucu bulunamadı. Optimizasyonu yeniden çalıştırın.")
+    st.stop()
+optimized_vehicle_count = st.session_state.get("optimized_vehicle_count", result.vehicle_count)
+result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
+result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
 
 st.subheader("3. Optimizasyon sonucu")
 for warning in result.warnings:
@@ -421,13 +511,23 @@ for warning in result.warnings:
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
-r1, r2, r3, r4 = st.columns(4)
-r1.metric("Önerilen servis sayısı", result.vehicle_count)
+multi_stop_count = sum(
+    stop["passenger_count"] > 1
+    for route in nonempty_routes
+    for stop in route["stops"]
+)
+single_stop_count = total_stop_count - multi_stop_count
+r1, r2, r3, r4, r5, r6 = st.columns(6)
+r1.metric("Önerilen servis", optimized_vehicle_count)
 r2.metric("Toplam çalışan", len(employees))
-r3.metric("Ortak durak sayısı", total_stop_count)
-r4.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
+r3.metric("Toplam durak", total_stop_count)
+r4.metric("Çoklu ortak durak", multi_stop_count)
+r5.metric("Tekil durak", single_stop_count)
+r6.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
 st.caption(
-    f"Ortak duraklar {result_max_walk_m} m azami kuş uçuşu yürüme sınırına göre önerildi. "
+    f"Duraklar {result_max_walk_m} m azami tahmini yürüyüş sınırına göre optimize edildi. "
+    "Tahmini yürüyüş, kuş uçuşu mesafeye %20 yol sapması eklenerek hesaplandı. "
+    f"Durak başına {result_wait_seconds} sn bekleme ve {result_max_route_minutes} dk toplam rota sınırı kullanıldı. "
     "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
 )
 
@@ -461,12 +561,13 @@ for route in nonempty_routes:
             row = employees.iloc[matrix_index - 1]
             ordered_coordinates.append((float(row["Enlem"]), float(row["Boylam"])))
             stop = stop_by_matrix_index[matrix_index]
-            stop_label = str(row["Adres"] or f"Ortak Durak {stop_number_by_index[matrix_index]}")
+            stop_type = "Ortak" if stop["passenger_count"] > 1 else "Tekil"
+            stop_label = str(row["Adres"] or f"{stop_type} Durak {stop_number_by_index[matrix_index]}")
             point_data.append(
                 {
                     "lon": float(row["Boylam"]), "lat": float(row["Enlem"]),
                     "label": (
-                        f"Rota {route['vehicle_no']} · Ortak Durak {stop_number_by_index[matrix_index]} · "
+                        f"Rota {route['vehicle_no']} · {stop_type} Durak {stop_number_by_index[matrix_index]} · "
                         f"{stop['passenger_count']} yolcu · {stop_label}"
                     ),
                     "stop_no": str(stop_number_by_index[matrix_index]),
@@ -514,12 +615,13 @@ deck = pdk.Deck(
     map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
     tooltip={"text": "{label}{route}"},
 )
-st.pydeck_chart(deck, use_container_width=True)
+st.pydeck_chart(deck, width="stretch")
 
 for route in nonempty_routes:
     st.markdown(
         f"""<div class="route-card"><b>Rota {route['vehicle_no']}</b> · {route['occupancy']}/{result_capacity} yolcu ·
-        {len(route['stops'])} ortak durak · {route['distance_km']:.1f} km · {route['drive_minutes']:.0f} dk ·
+        {len(route['stops'])} durak · {route['distance_km']:.1f} km · {route['drive_minutes']:.0f} dk sürüş ·
+        {route['total_minutes']:.0f} dk toplam ·
         ort. {route['average_walk_m']:.0f} m yürüme</div>""",
         unsafe_allow_html=True,
     )
@@ -534,7 +636,8 @@ for route in nonempty_routes:
         )
         stop_rows.append(
             {
-                "Durak": order,
+                "Durak": str(order),
+                "Durak Türü": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
                 "Yolcu": stop["passenger_count"],
                 "Ortak Durak Adresi": row["Adres"],
                 "En Uzak Yürüme": f"{stop['max_walk_m']:.0f} m",
@@ -543,8 +646,8 @@ for route in nonempty_routes:
         )
     if result_direction.startswith("Sabah"):
         stop_rows.append({"Durak": "Varış", "Sicil": "-", "Ad Soyad": "Fabrika", "Adres": factory_address})
-    with st.expander(f"Rota {route['vehicle_no']} ortak duraklarını ve yolcularını göster"):
-        st.dataframe(pd.DataFrame(stop_rows), use_container_width=True, hide_index=True)
+    with st.expander(f"Rota {route['vehicle_no']} duraklarını ve yolcularını göster"):
+        st.dataframe(pd.DataFrame(stop_rows), width="stretch", hide_index=True)
 
 export_bytes = result_workbook(shared_routes, employees, result_capacity)
 st.download_button(

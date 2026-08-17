@@ -334,23 +334,9 @@ def optimize_candidate_stops(
             f"Çalışan sıraları: {displayed}{suffix}."
         )
 
-    # Yüklenen/mevcut bir durakla kapsanabilen çalışan, otomatik adaylara
-    # aktarılmaz. Otomatik ve adres tabanlı adaylar yalnızca yüklenen duraklarla
-    # hiç kapsanamayan çalışanlar için devreye girer. Böylece durak türü önceliği
-    # sadece aday ayıklamada değil, asıl optimizasyon modelinde de uygulanır.
-    uploaded_sources = {"Yüklenen aday durak", "Onaylı durak"}
-    eligible_by_employee: list[list[int]] = []
-    for covering in cover_by_employee:
-        uploaded_covering = [
-            candidate_index
-            for candidate_index in covering
-            if candidates[candidate_index].source in uploaded_sources
-        ]
-        eligible_by_employee.append(uploaded_covering or covering)
-
     model = cp_model.CpModel()
     selected_vars = [model.new_bool_var(f"candidate_{index}") for index in range(len(candidates))]
-    for covering in eligible_by_employee:
+    for covering in cover_by_employee:
         model.add(sum(selected_vars[index] for index in covering) >= 1)
     model.minimize(sum(selected_vars))
 
@@ -362,14 +348,42 @@ def optimize_candidate_stops(
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise ValueError("Aday duraklar için kapsama çözümü bulunamadı.")
 
-    selected = {index for index, variable in enumerate(selected_vars) if solver.value(variable)}
-    minimum_stop_count = len(selected)
+    minimum_stop_count = sum(solver.value(variable) for variable in selected_vars)
     minimum_proven = status == cp_model.OPTIMAL
+
+    # Kanıtlı en az durak sayısı raporlanır; uygulanan plan ise operasyonel
+    # ağırlıklarla dengelenir. Yüklenen durak temel maliyettir. Otomatik bir
+    # nokta ancak yaklaşık üç mevcut durağı ikame edebiliyorsa avantajlı olur;
+    # çalışan adresi ise yalnızca gerçek kapsama boşluğunda yedek olarak kalır.
+    selection_cost = {
+        "Yüklenen aday durak": 10,
+        "Onaylı durak": 10,
+        "Otomatik ortak nokta": 25,
+        "Çalışan adresi": 50,
+    }
+    model.minimize(
+        sum(
+            selection_cost.get(candidate.source, 60) * selected_vars[index]
+            for index, candidate in enumerate(candidates)
+        )
+    )
+    preference_solver = cp_model.CpSolver()
+    preference_solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
+    preference_solver.parameters.num_search_workers = 1
+    preference_solver.parameters.random_seed = 42
+    preference_status = preference_solver.solve(model)
+    if preference_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise ValueError("Durak türü önceliği için uygulanabilir çözüm bulunamadı.")
+    selected = {
+        index
+        for index, variable in enumerate(selected_vars)
+        if preference_solver.value(variable)
+    }
 
     def walking_assignment(selected_indices: set[int]) -> tuple[list[int], list[float]]:
         assigned: list[int] = []
         walks: list[float] = []
-        for employee_index, covering in enumerate(eligible_by_employee):
+        for employee_index, covering in enumerate(cover_by_employee):
             feasible = [index for index in covering if index in selected_indices]
             chosen = min(feasible, key=lambda index: (distances_m[index][employee_index], index))
             assigned.append(chosen)
@@ -387,11 +401,18 @@ def optimize_candidate_stops(
             improvement = sum(
                 max(0.0, walks[employee_index] - distances_m[candidate_index][employee_index])
                 for employee_index in range(len(employee_coordinates))
-                if candidate_index in eligible_by_employee[employee_index]
+                if distances_m[candidate_index][employee_index] <= max_walk_m + 1e-9
             )
-            if improvement > best_improvement + 1e-9:
+            addition_penalty = {
+                "Yüklenen aday durak": 1.0,
+                "Onaylı durak": 1.0,
+                "Otomatik ortak nokta": 1.75,
+                "Çalışan adresi": 3.0,
+            }.get(candidates[candidate_index].source, 4.0)
+            adjusted_improvement = improvement / addition_penalty
+            if adjusted_improvement > best_improvement + 1e-9:
                 best_candidate = candidate_index
-                best_improvement = improvement
+                best_improvement = adjusted_improvement
         if best_candidate is None:
             break
         selected.add(best_candidate)

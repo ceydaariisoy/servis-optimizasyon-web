@@ -20,9 +20,6 @@ from core import (
 )
 
 
-APP_VERSION = "2026.08.17-stop-priority-v2"
-
-
 st.set_page_config(page_title="Servis Rota Optimizasyonu", page_icon="🚌", layout="wide")
 
 st.markdown(
@@ -43,7 +40,6 @@ st.caption(
     "Enlem ve boylam içeren Excel'i yükleyin; sistem minimum servis sayısını, "
     "ortak buluşma duraklarını, durak sırasını ve güzergâhları oluştursun."
 )
-st.caption(f"Uygulama sürümü: {APP_VERSION}")
 
 
 FACTORY_ADDRESS = (
@@ -675,7 +671,6 @@ file_key = hashlib.sha256(
     + previous_bytes
     + planning_label.encode("utf-8")
     + stop_policy_label.encode("utf-8")
-    + APP_VERSION.encode("utf-8")
 ).hexdigest()
 if st.session_state.get("file_key") != file_key:
     try:

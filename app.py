@@ -20,6 +20,11 @@ from core import (
 )
 
 
+APP_VERSION = "2026.08.17-simplified-planning-v1"
+FIXED_TARGET_AVERAGE_WALK_M = 400
+FIXED_WAIT_SECONDS_PER_STOP = 45
+
+
 st.set_page_config(page_title="Servis Rota Optimizasyonu", page_icon="🚌", layout="wide")
 
 st.markdown(
@@ -593,14 +598,7 @@ with st.sidebar:
         step=50,
         help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
     )
-    target_average_walk_m = st.slider(
-        "Hedef ortalama yürüme (metre)",
-        min_value=100,
-        max_value=int(max_walk_m),
-        value=min(300, int(max_walk_m)),
-        step=25,
-        help="Minimum durak çözümüne, ortalama yürüyüş bu hedefe inene kadar durak eklenir.",
-    )
+    target_average_walk_m = min(FIXED_TARGET_AVERAGE_WALK_M, int(max_walk_m))
     max_route_minutes = st.slider(
         "Azami rota süresi (dakika)",
         min_value=60,
@@ -609,13 +607,7 @@ with st.sidebar:
         step=5,
         help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
     )
-    wait_seconds_per_stop = st.number_input(
-        "Durak başına bekleme (saniye)",
-        min_value=0,
-        max_value=180,
-        value=45,
-        step=15,
-    )
+    wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
     direction_label = st.radio(
         "Sefer yönü",
         ["Sabah (08.00 varış): çalışan → fabrika", "Akşam (17.30 çıkış): fabrika → çalışan"],
@@ -671,6 +663,7 @@ file_key = hashlib.sha256(
     + previous_bytes
     + planning_label.encode("utf-8")
     + stop_policy_label.encode("utf-8")
+    + APP_VERSION.encode("utf-8")
 ).hexdigest()
 if st.session_state.get("file_key") != file_key:
     try:
@@ -835,15 +828,25 @@ if shared_routes is None:
 optimized_vehicle_count = result["vehicle_count"]
 result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
 result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
-result_target_average_walk_m = st.session_state.get("result_target_average_walk_m", 300)
+result_target_average_walk_m = st.session_state.get(
+    "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
+)
 
 st.subheader("3. Optimizasyon sonucu")
-for warning in result["warnings"]:
-    st.warning(warning)
+for warning in result.get("warnings", []):
+    if "Yol ağı verisi kullanılamadı" in warning:
+        st.warning("Gerçek yol verisine ulaşılamadı; rota yaklaşık mesafeyle hesaplandı.")
+    elif "maksimum rota süresini aşıyor" in warning:
+        st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
 
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
+automatic_stop_count = sum(
+    stop.get("source") in {"Otomatik ortak nokta", "Çalışan adresi"}
+    for route in nonempty_routes
+    for stop in route["stops"]
+)
 multi_stop_count = sum(
     stop["passenger_count"] > 1
     for route in nonempty_routes
@@ -882,6 +885,11 @@ s3.metric("Ortalama yürüme", f"{average_walk:.0f} m")
 s4.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
 s5.metric("Toplam mesafe", f"{total_distance:.1f} km")
 s6.metric("En uzun rota", f"{longest_route:.0f} dk")
+if automatic_stop_count:
+    st.caption(
+        f"{automatic_stop_count} otomatik/adres tabanlı durak önerildi; "
+        "kesinleştirilmeden önce saha uygunluğu kontrol edilmelidir."
+    )
 if result.get("planning_mode") == "incremental":
     st.success(
         f"Mevcut plan korundu: {result.get('preserved_employee_count', 0)} çalışan eski durağında kaldı; "
@@ -895,13 +903,10 @@ if result.get("planning_mode") == "incremental":
     )
 else:
     st.caption(
-        "Yöntem: durak seçimi içeren okul/personel servisi rotalama (SBRP-BSS). "
-        f"Önce {result_max_walk_m} m azami yürüyüşle "
-        f"{'kanıtlı minimum' if result['minimum_proven'] else 'süre sınırında bulunan en iyi'} durak planı kuruldu; "
-        f"ardından ortalama yürüyüşü {result_target_average_walk_m} m hedefine yaklaştırmak için durak eklendi. "
-        "Tahmini yürüyüş, kuş uçuşu mesafeye %20 yol sapması eklenerek hesaplandı. "
-        f"Durak başına {result_wait_seconds} sn bekleme ve {result_max_route_minutes} dk toplam rota sınırı kullanıldı. "
-        "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
+        f"Hesaplama: {result_max_walk_m} m azami yürüyüş, "
+        f"{result_target_average_walk_m} m sabit konfor hedefi, "
+        f"durak başına {result_wait_seconds} sn bekleme ve "
+        f"{result_max_route_minutes} dk azami rota süresi."
     )
 
 palette = [

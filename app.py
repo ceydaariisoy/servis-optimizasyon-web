@@ -12,17 +12,23 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    build_route_schedule,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
+    refine_common_stops_with_pedestrian_network,
+    split_common_stops_by_capacity,
     update_routes_incrementally,
+    validate_route_solution,
 )
 
 
-APP_VERSION = "2026.08.24-professional-ui-v2"
+APP_VERSION = "2026.09.01-operational-routing-v3"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 45
+MORNING_SHIFT_MINUTES = 8 * 60
+EVENING_SHIFT_MINUTES = 17 * 60 + 30
 
 
 st.set_page_config(
@@ -546,6 +552,8 @@ def materialize_shared_routes(
     distance_matrix: list[list[float]],
     direction: str,
     wait_seconds_per_stop: int,
+    shift_time_minutes: int,
+    arrival_buffer_minutes: int,
 ) -> list[dict]:
     """Ortak durak nesnelerini arayüz ve Excel çıktısının kullandığı yapıya çevirir."""
     shared_routes = []
@@ -581,6 +589,16 @@ def materialize_shared_routes(
             for stop in stops
             for distance in stop["walk_by_employee"].values()
         ]
+        schedule = build_route_schedule(
+            allocated_stops,
+            duration_matrix,
+            direction,
+            wait_seconds_per_stop,
+            shift_time_minutes,
+            arrival_buffer_minutes,
+        )
+        for stop in stops:
+            stop["scheduled_time"] = schedule["stop_times"].get(stop["anchor_matrix_index"], "-")
         shared_routes.append(
             {
                 "vehicle_no": vehicle_no,
@@ -593,6 +611,9 @@ def materialize_shared_routes(
                 "total_minutes": drive_seconds / 60 + len(stops) * wait_seconds_per_stop / 60,
                 "average_walk_m": sum(all_walks) / len(all_walks) if all_walks else 0,
                 "max_walk_m": max(all_walks, default=0),
+                "route_start_time": schedule["route_start_time"],
+                "route_end_time": schedule["route_end_time"],
+                "factory_time": schedule["factory_time"],
             }
         )
     return shared_routes
@@ -611,6 +632,13 @@ def build_shared_routes(
     use_road_network: bool,
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
+    use_walking_network: bool,
+    allow_walking_fallback: bool,
+    traffic_factor: float,
+    allow_approximate_fallback: bool,
+    compactness_penalty: float,
+    shift_time_minutes: int,
+    arrival_buffer_minutes: int,
 ):
     """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
@@ -628,6 +656,16 @@ def build_shared_routes(
         target_average_walk_m=target_average_walk_m,
         walking_factor=1.20,
     )
+    walking_source = "Tahmini yürüme"
+    walking_warnings: list[str] = []
+    if use_walking_network:
+        all_stops, walking_source, walking_warnings = refine_common_stops_with_pedestrian_network(
+            all_stops,
+            employee_coordinates,
+            max_walk_m=max_walk_m,
+            allow_fallback=allow_walking_fallback,
+        )
+    all_stops = split_common_stops_by_capacity(all_stops, capacity)
     route_coordinates = [
         factory_coordinates,
         *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
@@ -637,7 +675,10 @@ def build_shared_routes(
     duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
         route_coordinates,
         use_road_network=use_road_network,
+        traffic_factor=traffic_factor,
+        allow_approximate_fallback=allow_approximate_fallback,
     )
+    warnings = [*walking_warnings, *warnings]
 
     minimum_vehicle_count = math.ceil(len(employees) / capacity)
     vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
@@ -664,6 +705,7 @@ def build_shared_routes(
                 direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=max_route_minutes,
+                compactness_penalty_seconds_per_degree=compactness_penalty,
             )
             break
         except ValueError as exc:
@@ -683,7 +725,21 @@ def build_shared_routes(
         distance_matrix,
         direction,
         wait_seconds_per_stop,
+        shift_time_minutes,
+        arrival_buffer_minutes,
     )
+    audit = validate_route_solution(
+        allocated_routes,
+        employee_count=len(employees),
+        capacity=capacity,
+        max_walk_m=max_walk_m,
+        duration_matrix=duration_matrix,
+        direction=direction,
+        wait_seconds_per_stop=wait_seconds_per_stop,
+        max_route_minutes=max_route_minutes,
+    )
+    if not audit["valid"]:
+        raise ValueError("Rota kısıt denetimi başarısız: " + " ".join(audit["errors"]))
     if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
         warnings.append(
             "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
@@ -695,8 +751,10 @@ def build_shared_routes(
         "minimum_proven": minimum_proven,
         "selected_stop_count": len(all_stops),
         "matrix_source": matrix_source,
+        "walking_source": walking_source,
         "warnings": warnings,
         "planning_mode": "full",
+        "audit": audit,
     }
     return shared_routes, meta
 
@@ -715,6 +773,13 @@ def build_incremental_shared_routes(
     use_road_network: bool,
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
+    use_walking_network: bool,
+    allow_walking_fallback: bool,
+    traffic_factor: float,
+    allow_approximate_fallback: bool,
+    compactness_penalty: float,
+    shift_time_minutes: int,
+    arrival_buffer_minutes: int,
 ):
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
     allocated_routes, duration_matrix, distance_matrix, meta = update_routes_incrementally(
@@ -732,13 +797,23 @@ def build_incremental_shared_routes(
         mode=mode,
         use_road_network=use_road_network,
         allow_automatic_candidates=allow_automatic_candidates,
+        traffic_factor=traffic_factor,
+        allow_approximate_fallback=allow_approximate_fallback,
     )
+    if use_walking_network:
+        meta.setdefault("warnings", []).append(
+            "Artımlı güncellemede eski durak eşleşmeleri korunur; gerçek yaya yolu değişiklikleri "
+            "için dönemsel olarak Tam optimizasyon çalıştırılmalıdır."
+        )
+    meta["walking_source"] = "Korunan plan / tahmini yürüme"
     shared_routes = materialize_shared_routes(
         allocated_routes,
         duration_matrix,
         distance_matrix,
         direction,
         wait_seconds_per_stop,
+        shift_time_minutes,
+        arrival_buffer_minutes,
     )
     return shared_routes, meta
 
@@ -763,6 +838,8 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                 "Toplam_Sure_dk": round(route["total_minutes"]),
                 "Ort_Yurume_m": round(route["average_walk_m"]),
                 "En_Uzak_Yurume_m": round(route["max_walk_m"]),
+                "Rota_Baslangic_Saati": route["route_start_time"],
+                "Fabrika_Saati": route["factory_time"],
             }
         )
         for order, stop in enumerate(route["stops"], start=1):
@@ -777,6 +854,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                     "Enlem": stop["latitude"],
                     "Boylam": stop["longitude"],
                     "En_Uzak_Yurume_m": round(stop["max_walk_m"]),
+                    "Planlanan_Saat": stop.get("scheduled_time", "-"),
                 }
             )
             for employee_index in stop["member_indices"]:
@@ -793,6 +871,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                         "Yurume_Mesafesi_m": round(stop["walk_by_employee"][employee_index]),
                         "Durak_Enlem": stop["latitude"],
                         "Durak_Boylam": stop["longitude"],
+                        "Planlanan_Alis_Birakma_Saati": stop.get("scheduled_time", "-"),
                     }
                 )
     output = BytesIO()
@@ -869,7 +948,7 @@ with st.sidebar:
             "Azami yürüme mesafesi",
             min_value=200,
             max_value=1200,
-            value=500,
+            value=1000,
             step=50,
             format="%d m",
             help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
@@ -885,6 +964,32 @@ with st.sidebar:
             help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
         )
         wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
+        traffic_buffer_percent = st.slider(
+            "Trafik ve operasyon süre tamponu",
+            min_value=0,
+            max_value=40,
+            value=20,
+            step=5,
+            format="%%%d",
+            help="OSRM sürelerini sabah trafiği ve operasyon belirsizliği için artırır.",
+        )
+        arrival_buffer_minutes = st.slider(
+            "Vardiyadan önce varış tamponu",
+            min_value=0,
+            max_value=20,
+            value=10,
+            step=5,
+            format="%d dk",
+            help="Sabah servislerini 08.00'dan bu kadar dakika önce fabrikaya ulaştırır.",
+        )
+        compactness_penalty = st.slider(
+            "Rota bölgesel bütünlük gücü",
+            min_value=0.0,
+            max_value=8.0,
+            value=3.0,
+            step=0.5,
+            help="Yüksek değer, aynı aracın şehrin farklı yönleri arasında gidip gelmesini daha fazla cezalandırır.",
+        )
 
     with st.expander("Sefer ve yol hesabı", expanded=True):
         direction_label = st.selectbox(
@@ -895,12 +1000,30 @@ with st.sidebar:
             ],
         )
         use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
-        road_consent = False
+        allow_approximate_fallback = False
         if use_road_network:
+            allow_approximate_fallback = st.checkbox(
+                "Yol servisi çalışmazsa yaklaşık hesaba izin ver",
+                value=False,
+                help="Kapalı bırakılırsa gerçek yol verisi alınamadığında operasyonel plan üretilmez.",
+            )
+        use_walking_network = st.checkbox(
+            "Gerçek yaya yolu mesafesini doğrula",
+            value=True,
+            help="Çalışan-durak mesafelerini yaya yolu ağı üzerinden yeniden kontrol eder.",
+        )
+        allow_walking_fallback = False
+        if use_walking_network:
+            allow_walking_fallback = st.checkbox(
+                "Yaya yolu servisi çalışmazsa tahmini hesaba izin ver",
+                value=False,
+            )
+        road_consent = False
+        if use_road_network or use_walking_network:
             road_consent = st.checkbox(
-                "Koordinatların yol hesabı için paylaşılmasını onaylıyorum",
+                "Koordinatların araç/yaya yol hesabı için paylaşılmasını onaylıyorum",
                 help=(
-                    "Yalnızca koordinatlar açık OSRM servisine gönderilir. "
+                    "Yalnızca koordinatlar açık yol servislerine gönderilir. "
                     "İsim, sicil ve açık adres paylaşılmaz."
                 ),
             )
@@ -1050,7 +1173,7 @@ else:
     st.success(f"{len(employees)} personelin koordinatı hazır. Rota hesabına geçebilirsiniz.")
 
 ready = not employees.empty and employees[["Enlem", "Boylam"]].notna().all(axis=1).all()
-road_ready = not use_road_network or road_consent
+road_ready = not (use_road_network or use_walking_network) or road_consent
 incremental_mode = planning_label.startswith("Mevcut")
 previous_plan_source = previous_plan_file or st.session_state.get("last_plan_bytes")
 incremental_ready = not incremental_mode or (
@@ -1064,8 +1187,8 @@ section_header(
     "Rotaları oluştur",
     "Seçilen ayarlara göre ortak durakları, araç dağılımını ve güzergâh sırasını hesaplayın.",
 )
-if use_road_network and not road_consent:
-    st.info("Gerçek yol güzergâhı için sol menüdeki koordinat paylaşım onayını işaretleyin.")
+if (use_road_network or use_walking_network) and not road_consent:
+    st.info("Gerçek araç/yaya yolu hesabı için sol menüdeki koordinat paylaşım onayını işaretleyin.")
 if incremental_mode and mapping["id"] is None:
     st.error("Mevcut planı korumak için çalışan Excel'inde benzersiz bir sicil/ID sütunu seçilmelidir.")
 if not approved_ready:
@@ -1081,6 +1204,7 @@ if st.button(
         try:
             mode = "fixed" if mode_label.startswith("Sabit") else "auto"
             direction = "morning" if direction_label.startswith("Sabah") else "evening"
+            shift_time_minutes = MORNING_SHIFT_MINUTES if direction == "morning" else EVENING_SHIFT_MINUTES
             common_arguments = {
                 "employees": employees,
                 "factory_coordinates": (factory_lat, factory_lon),
@@ -1094,6 +1218,13 @@ if st.button(
                 "use_road_network": bool(use_road_network),
                 "approved_candidates": st.session_state.get("approved_candidates", []),
                 "allow_automatic_candidates": allow_automatic_candidates,
+                "use_walking_network": bool(use_walking_network),
+                "allow_walking_fallback": bool(allow_walking_fallback),
+                "traffic_factor": 1.0 + float(traffic_buffer_percent) / 100.0,
+                "allow_approximate_fallback": bool(allow_approximate_fallback),
+                "compactness_penalty": float(compactness_penalty),
+                "shift_time_minutes": int(shift_time_minutes),
+                "arrival_buffer_minutes": int(arrival_buffer_minutes),
             }
             if incremental_mode:
                 baseline_routes = read_previous_routes(previous_plan_source, employees)
@@ -1118,6 +1249,8 @@ if st.button(
             st.session_state["result_mode"] = mode
             st.session_state["result_planning_mode"] = "incremental" if incremental_mode else "full"
             st.session_state["result_allow_automatic_candidates"] = allow_automatic_candidates
+            st.session_state["result_traffic_buffer_percent"] = int(traffic_buffer_percent)
+            st.session_state["result_arrival_buffer_minutes"] = int(arrival_buffer_minutes)
         except Exception as exc:
             st.session_state.pop("result", None)
             st.session_state.pop("shared_routes", None)
@@ -1133,7 +1266,7 @@ employees = st.session_state["result_employees"]
 factory_lat, factory_lon, factory_address = st.session_state["result_factory"]
 result_direction = st.session_state["result_direction"]
 result_capacity = st.session_state["result_capacity"]
-result_max_walk_m = st.session_state.get("result_max_walk_m", 500)
+result_max_walk_m = st.session_state.get("result_max_walk_m", 1000)
 direction = "morning" if result_direction.startswith("Sabah") else "evening"
 shared_routes = st.session_state.get("shared_routes")
 if shared_routes is None:
@@ -1145,6 +1278,8 @@ result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
 result_target_average_walk_m = st.session_state.get(
     "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
 )
+result_traffic_buffer_percent = st.session_state.get("result_traffic_buffer_percent", 20)
+result_arrival_buffer_minutes = st.session_state.get("result_arrival_buffer_minutes", 10)
 
 section_header(
     "04",
@@ -1156,6 +1291,18 @@ for warning in result.get("warnings", []):
         st.warning("Gerçek yol verisine ulaşılamadı; rota yaklaşık mesafeyle hesaplandı.")
     elif "maksimum rota süresini aşıyor" in warning:
         st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
+    else:
+        st.warning(warning)
+
+audit = result.get("audit", {})
+if audit.get("valid"):
+    st.success(
+        "Kısıt denetimi geçti: tüm çalışanlar bir kez atandı; kapasite, yürüme ve rota süresi sınırları sağlandı."
+    )
+st.caption(
+    f"Araç yolu hesabı: {result.get('matrix_source', 'Bilinmiyor')} · "
+    f"Yürüme hesabı: {result.get('walking_source', 'Tahmini yürüme')}"
+)
 
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
@@ -1228,7 +1375,9 @@ else:
         f"Hesaplama: {result_max_walk_m} m azami yürüyüş, "
         f"{result_target_average_walk_m} m sabit konfor hedefi, "
         f"durak başına {result_wait_seconds} sn bekleme ve "
-        f"{result_max_route_minutes} dk azami rota süresi."
+        f"{result_max_route_minutes} dk azami rota süresi · "
+        f"%{result_traffic_buffer_percent} süre tamponu · "
+        f"vardiyadan {result_arrival_buffer_minutes} dk önce hedef varış."
     )
 
 palette = [
@@ -1301,10 +1450,16 @@ layers = [
 ]
 all_lats = [factory_lat, *employees["Enlem"].astype(float).tolist()]
 all_lons = [factory_lon, *employees["Boylam"].astype(float).tolist()]
+latitude_span = max(all_lats) - min(all_lats)
+longitude_span = (max(all_lons) - min(all_lons)) * math.cos(
+    math.radians(sum(all_lats) / len(all_lats))
+)
+map_span = max(latitude_span, longitude_span, 0.01)
+auto_zoom = min(12.0, max(6.5, math.log2(360.0 / map_span) - 1.2))
 view_state = pdk.ViewState(
     latitude=(min(all_lats) + max(all_lats)) / 2,
     longitude=(min(all_lons) + max(all_lons)) / 2,
-    zoom=9.8,
+    zoom=auto_zoom,
     pitch=0,
 )
 deck = pdk.Deck(
@@ -1335,6 +1490,8 @@ for route in nonempty_routes:
                 <div class="route-stat"><strong>{route['drive_minutes']:.0f} dk</strong><span>Sürüş</span></div>
                 <div class="route-stat"><strong>{route['total_minutes']:.0f} dk</strong><span>Toplam süre</span></div>
                 <div class="route-stat"><strong>{route['average_walk_m']:.0f} m</strong><span>Ort. yürüme</span></div>
+                <div class="route-stat"><strong>{route['route_start_time']}</strong><span>Rota başlangıcı</span></div>
+                <div class="route-stat"><strong>{route['route_end_time']}</strong><span>Rota bitişi</span></div>
             </div>
         </div>
         """,
@@ -1350,6 +1507,7 @@ for route in nonempty_routes:
                 "Konum": factory_address,
                 "Yolcu": None,
                 "En Uzak Yürüme": "-",
+                "Planlanan Saat": route["factory_time"],
                 "Bu Durağa Gelecekler": "-",
             }
         )
@@ -1366,6 +1524,7 @@ for route in nonempty_routes:
                 "Konum": stop["label"],
                 "Yolcu": stop["passenger_count"],
                 "En Uzak Yürüme": f"{stop['max_walk_m']:.0f} m",
+                "Planlanan Saat": stop.get("scheduled_time", "-"),
                 "Bu Durağa Gelecekler": passenger_names,
             }
         )
@@ -1378,6 +1537,7 @@ for route in nonempty_routes:
                 "Konum": factory_address,
                 "Yolcu": None,
                 "En Uzak Yürüme": "-",
+                "Planlanan Saat": route["factory_time"],
                 "Bu Durağa Gelecekler": "-",
             }
         )

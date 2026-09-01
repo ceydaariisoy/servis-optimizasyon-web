@@ -1,14 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    build_route_schedule,
     build_estimated_matrices,
     cluster_common_stops,
     generate_candidate_stops,
+    get_travel_matrices,
     optimize_candidate_stops,
     plan_routes,
+    refine_common_stops_with_pedestrian_network,
+    split_common_stops_by_capacity,
     update_routes_incrementally,
+    validate_route_solution,
 )
 
 
@@ -214,6 +220,96 @@ class RoutePlannerTests(unittest.TestCase):
         self.assertEqual(sorted(assigned), [0, 1])
         self.assertEqual(meta["preserved_employee_count"], 1)
         self.assertEqual(meta["new_stop_count"], 1)
+
+    def test_morning_schedule_arrives_before_shift_with_buffer(self):
+        stop = CommonStop(
+            anchor_index=0,
+            member_indices=[0],
+            walking_distances_m=[100],
+            latitude=39.78,
+            longitude=30.52,
+            matrix_index=1,
+        )
+        duration_matrix = [[0, 600], [600, 0]]
+        schedule = build_route_schedule(
+            [stop],
+            duration_matrix,
+            direction="morning",
+            wait_seconds_per_stop=60,
+            shift_time_minutes=8 * 60,
+            arrival_buffer_minutes=10,
+        )
+        self.assertEqual(schedule["stop_times"][1], "07:39")
+        self.assertEqual(schedule["factory_time"], "07:50")
+
+    def test_solution_audit_detects_duplicate_employee(self):
+        first = CommonStop(0, [0], [50], matrix_index=1)
+        second = CommonStop(1, [0, 1], [30, 40], matrix_index=2)
+        duration_matrix = [
+            [0, 300, 300],
+            [300, 0, 120],
+            [300, 120, 0],
+        ]
+        audit = validate_route_solution(
+            [[first, second]],
+            employee_count=2,
+            capacity=4,
+            max_walk_m=500,
+            duration_matrix=duration_matrix,
+            direction="morning",
+            wait_seconds_per_stop=45,
+            max_route_minutes=120,
+        )
+        self.assertFalse(audit["valid"])
+        self.assertTrue(any("birden fazla" in error for error in audit["errors"]))
+
+    def test_strict_road_mode_does_not_silently_fallback(self):
+        with patch("core.fetch_osrm_table", side_effect=RuntimeError("service down")):
+            with self.assertRaisesRegex(ValueError, "Gerçek yol ağı"):
+                get_travel_matrices(
+                    [(39.77, 30.52), (39.78, 30.53)],
+                    use_road_network=True,
+                    allow_approximate_fallback=False,
+                )
+
+    def test_pedestrian_refinement_reassigns_by_real_walking_distance(self):
+        stops = [
+            CommonStop(0, [0], [100], 39.77, 30.52, "Durak A", "Onaylı durak"),
+            CommonStop(1, [1], [100], 39.78, 30.53, "Durak B", "Onaylı durak"),
+        ]
+        employees = [(39.771, 30.521), (39.781, 30.531)]
+        with patch(
+            "core.fetch_pedestrian_distance_matrix",
+            return_value=[[200, 1800], [1400, 300]],
+        ):
+            refined, source, warnings = refine_common_stops_with_pedestrian_network(
+                stops,
+                employees,
+                max_walk_m=1000,
+                allow_fallback=False,
+            )
+        self.assertEqual(source, "Valhalla yaya yolu")
+        self.assertFalse(warnings)
+        self.assertEqual(refined[0].member_indices, [0])
+        self.assertEqual(refined[1].member_indices, [1])
+        self.assertEqual(refined[1].walking_distances_m, [300])
+
+    def test_oversized_common_stop_is_split_by_vehicle_capacity(self):
+        stop = CommonStop(
+            0,
+            list(range(45)),
+            [100] * 45,
+            39.77,
+            30.52,
+            "Merkez durak",
+            "Onaylı durak",
+        )
+        fragments = split_common_stops_by_capacity([stop], capacity=40)
+        self.assertEqual([fragment.passenger_count for fragment in fragments], [40, 5])
+        self.assertEqual(
+            sorted(index for fragment in fragments for index in fragment.member_indices),
+            list(range(45)),
+        )
 
 
 if __name__ == "__main__":

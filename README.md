@@ -17,8 +17,13 @@ Uygulanan problem sınıfı **durak seçimi içeren okul/personel servisi rotala
 - CP-SAT set-cover modeliyle tüm çalışanları kapsayan **teorik minimum durak sayısı**
 - Minimum durak ile çalışan konforu arasında ayarlanabilir **hedef ortalama yürüme** dengesi
 - Her çalışanın tam bir durağa atanması ve azami yürüme sınırının korunması
+- Valhalla tabanlı gerçek yaya yolu doğrulaması; ulaşılamayan çalışan için güvenli hata/aday üretimi
 - OR-Tools ile durak talebi, araç kapasitesi, gerçek yol süresi ve rota sırasını birlikte çözen araç rotalama modeli
 - Ayarlanabilir azami rota süresi ve durak başına bekleme süresi
+- Trafik ve operasyon belirsizliği için ayarlanabilir süre tamponu
+- Rotaların farklı şehir bölgeleri arasında sıçramasını azaltan bölgesel bütünlük cezası
+- 08.00 vardiyasına göre geriye hesaplanan durak alış saatleri ve erken varış tamponu
+- Sonuç sonrası çalışan, kapasite, yürüme ve süre kısıtlarını bağımsız doğrulayan denetim
 - Sabah (çalışan → fabrika) ve akşam (fabrika → çalışan) yönü
 - Aktif olmayan veya servis kullanmayan çalışanları dışarıda bırakma
 - Yeni çalışan eklendiğinde ya da çalışan ayrıldığında güncel Excel ile yeniden hesaplama
@@ -34,13 +39,18 @@ Uygulanan problem sınıfı **durak seçimi içeren okul/personel servisi rotala
    ev çiftlerinin orta noktaları ortak durak adayı olur. Mevcut/adayı durak dosyası varsa
    bu noktalar öncelikli aday olarak eklenir.
 2. CP-SAT set-cover modeli, her çalışan azami yürüme sınırındaki en az bir durakla
-   kapsanacak şekilde teorik minimum durak sayısını bulur.
-3. Ortalama yürüyüş seçilen hedefin üzerindeyse en çok yürüme iyileştirmesi sağlayan
+   kapsanacak şekilde teorik minimum durak sayısını bulur. Eşit sayıda durak kullanan
+   çözümler arasından toplam yürüyüşü en düşük olan seçilir.
+3. Seçilen eşleşmeler gerçek yaya yolu matrisiyle doğrulanır. Ortalama yürüyüş seçilen
+   hedefin üzerindeyse en çok yürüme iyileştirmesi sağlayan
    duraklar eklenir. Böylece salt minimum durak çözümünün çalışanlara gereksiz yük
    bindirmesi önlenir.
 4. Seçilen durakların yolcu talepleriyle kapasite ve azami rota süresi kısıtlı açık
-   araç rotalama modeli çözülür. Otomatik mod, kapasite alt sınırından başlayarak süre
-   kısıtı gerekirse araç ekler.
+   araç rotalama modeli çözülür. Sürelere trafik tamponu uygulanır; bölgesel bütünlük
+   cezası rota kesişmelerini ve gereksiz yön değişimlerini azaltır. Otomatik mod,
+   kapasite alt sınırından başlayarak süre kısıtı gerekirse araç ekler.
+5. Sabah durak saatleri 08.00 vardiya başlangıcı ve erken varış tamponuna göre geriye
+   hesaplanır. Son çözüm bağımsız kısıt denetiminden geçmeden yayımlanmaz.
 
 Bu yapı, Schittekat vd. (2013) tarafından ele alınan SBRP-BSS yaklaşımıyla ve çalışan
 servisi için durak kapsama, kapasite ve rota süresi kısıtlarını birlikte kullanan
@@ -110,10 +120,11 @@ eşleştirme için çalışan sicil/ID değerleri dolu ve benzersiz olmalıdır.
 
 ## Önemli not
 
-Yürüyüş mesafesi, kuş uçuşu mesafeye şehir içi sapmaları temsil eden %20 güvenlik payı
-eklenerek tahmin edilir. Üretim kullanımında çalışan-durak yürüyüş mesafelerinin gerçek
-yaya yolu ağıyla doğrulanması gerekir. Rota başlamadan önce yol yasakları, durak güvenliği,
-kaldırım/yaya geçidi, vardiya saati ve trafik koşulları operasyon ekibi tarafından kontrol edilmelidir.
+İlk aday elemesinde yürüyüş mesafesi, kuş uçuşu mesafeye %20 güvenlik payı eklenerek
+tahmin edilir; seçilen eşleşmeler daha sonra gerçek yaya yolu matrisiyle doğrulanır.
+Yaya yolu servisine ulaşılamadığında yaklaşık hesaba geçiş varsayılan olarak kapalıdır.
+Rota başlamadan önce yol yasakları, durak güvenliği, kaldırım/yaya geçidi, vardiya saati
+ve trafik koşulları operasyon ekibi tarafından ayrıca kontrol edilmelidir.
 
 ## Literatür
 

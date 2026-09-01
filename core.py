@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import json
 import math
+import os
 import re
 from typing import Iterable, Sequence
 from urllib.parse import urlencode
@@ -25,6 +26,10 @@ from ortools.sat.python import cp_model
 EARTH_RADIUS_KM = 6371.0088
 ESKISEHIR_CENTER = (39.7767, 30.5206)
 ESKISEHIR_MAX_DISTANCE_KM = 55.0
+DEFAULT_PEDESTRIAN_MATRIX_URL = os.getenv(
+    "PEDESTRIAN_MATRIX_URL",
+    "https://valhalla1.openstreetmap.de/sources_to_targets",
+)
 
 
 @dataclass
@@ -96,6 +101,84 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     dlon = lon2 - lon1
     h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+
+
+def scale_duration_matrix(
+    durations: Sequence[Sequence[float]],
+    factor: float,
+) -> list[list[float]]:
+    """Sürüş sürelerine trafik/operasyon güvenlik katsayısı uygular."""
+    if factor < 1.0:
+        raise ValueError("Trafik katsayısı 1,00 veya daha büyük olmalıdır.")
+    return [[float(value) * factor for value in row] for row in durations]
+
+
+def _clock_text(total_seconds: float) -> str:
+    """Gece yarısını aşan değerleri de 24 saatlik saat metnine çevirir."""
+    rounded_minutes = int(round(total_seconds / 60)) % (24 * 60)
+    return f"{rounded_minutes // 60:02d}:{rounded_minutes % 60:02d}"
+
+
+def build_route_schedule(
+    stops: Sequence[CommonStop],
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str,
+    wait_seconds_per_stop: int,
+    shift_time_minutes: int,
+    arrival_buffer_minutes: int = 0,
+) -> dict[str, object]:
+    """Durak sırasını vardiya saatine bağlayan tahmini zaman çizelgesini üretir.
+
+    Sabah planı, vardiya saatinden varış tamponunu çıkarıp geriye doğru; akşam
+    planı vardiya çıkış saatinden ileri doğru hesaplanır. Süre matrisinin trafik
+    katsayısı uygulanmış hali verilmelidir.
+    """
+    if direction not in {"morning", "evening"}:
+        raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+    indices = [int(stop.matrix_index) for stop in stops]
+    stop_times: dict[int, str] = {}
+    if not indices:
+        reference = shift_time_minutes * 60
+        return {
+            "stop_times": stop_times,
+            "route_start_time": _clock_text(reference),
+            "route_end_time": _clock_text(reference),
+            "factory_time": _clock_text(reference),
+        }
+
+    if direction == "morning":
+        target_seconds = (shift_time_minutes - max(0, arrival_buffer_minutes)) * 60
+        path = [*indices, 0]
+        drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path, path[1:]))
+        total_seconds = drive_seconds + len(indices) * wait_seconds_per_stop
+        current = target_seconds - total_seconds
+        route_start = current
+        for position, matrix_index in enumerate(indices):
+            stop_times[matrix_index] = _clock_text(current)
+            current += wait_seconds_per_stop
+            next_index = path[position + 1]
+            current += duration_matrix[matrix_index][next_index]
+        return {
+            "stop_times": stop_times,
+            "route_start_time": _clock_text(route_start),
+            "route_end_time": _clock_text(current),
+            "factory_time": _clock_text(current),
+        }
+
+    current = shift_time_minutes * 60
+    route_start = current
+    previous = 0
+    for matrix_index in indices:
+        current += duration_matrix[previous][matrix_index]
+        stop_times[matrix_index] = _clock_text(current)
+        current += wait_seconds_per_stop
+        previous = matrix_index
+    return {
+        "stop_times": stop_times,
+        "route_start_time": _clock_text(route_start),
+        "route_end_time": _clock_text(current),
+        "factory_time": _clock_text(route_start),
+    }
 
 
 def cluster_common_stops(
@@ -281,6 +364,218 @@ def generate_candidate_stops(
     return [value[1] for value in best_by_coverage.values()]
 
 
+def fetch_pedestrian_distance_matrix(
+    stop_coordinates: Sequence[tuple[float, float]],
+    employee_coordinates: Sequence[tuple[float, float]],
+    endpoint: str = DEFAULT_PEDESTRIAN_MATRIX_URL,
+    timeout: int = 30,
+    block_size: int = 20,
+) -> list[list[float]]:
+    """Valhalla uyumlu bir servisle gerçek yaya yolu mesafe matrisi alır."""
+    if not stop_coordinates:
+        return []
+    if not employee_coordinates:
+        return [[] for _ in stop_coordinates]
+    if block_size < 1:
+        raise ValueError("Yaya yolu matris blok büyüklüğü en az 1 olmalıdır.")
+
+    result = [
+        [math.inf for _ in employee_coordinates]
+        for _ in stop_coordinates
+    ]
+    source_blocks = [
+        list(range(start, min(start + block_size, len(stop_coordinates))))
+        for start in range(0, len(stop_coordinates), block_size)
+    ]
+    target_blocks = [
+        list(range(start, min(start + block_size, len(employee_coordinates))))
+        for start in range(0, len(employee_coordinates), block_size)
+    ]
+    for source_indices in source_blocks:
+        for target_indices in target_blocks:
+            payload = {
+                "sources": [
+                    {"lat": float(stop_coordinates[index][0]), "lon": float(stop_coordinates[index][1])}
+                    for index in source_indices
+                ],
+                "targets": [
+                    {"lat": float(employee_coordinates[index][0]), "lon": float(employee_coordinates[index][1])}
+                    for index in target_indices
+                ],
+                "costing": "pedestrian",
+                "units": "kilometers",
+            }
+            request = Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Eskisehir-Servis-Optimizasyonu/2.0",
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=timeout) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            rows = response_payload.get("sources_to_targets")
+            if not rows or len(rows) != len(source_indices):
+                raise RuntimeError("Yaya yolu servisi geçerli bir mesafe matrisi döndürmedi.")
+            for source_position, source_index in enumerate(source_indices):
+                if len(rows[source_position]) != len(target_indices):
+                    raise RuntimeError("Yaya yolu servisinin matris boyutu beklenenden farklı.")
+                for target_position, target_index in enumerate(target_indices):
+                    cell = rows[source_position][target_position] or {}
+                    distance_km = cell.get("distance")
+                    if distance_km is None:
+                        raise RuntimeError("Bazı çalışan-durak çiftleri için yaya yolu bulunamadı.")
+                    result[source_index][target_index] = float(distance_km) * 1000
+    return result
+
+
+def refine_common_stops_with_pedestrian_network(
+    stops: Sequence[CommonStop],
+    employee_coordinates: Sequence[tuple[float, float]],
+    max_walk_m: float,
+    endpoint: str = DEFAULT_PEDESTRIAN_MATRIX_URL,
+    allow_fallback: bool = True,
+) -> tuple[list[CommonStop], str, list[str]]:
+    """Tahmini eşleşmeleri gerçek yaya yollarıyla doğrular ve yeniden atar.
+
+    Seçili duraklarla gerçek yaya yolu sınırını sağlayamayan çalışan için adres
+    tabanlı bir saha-onay adayı eklenir. Böylece azami yürüyüş kısıtı sessizce
+    ihlal edilmez.
+    """
+    if not stops:
+        return [], "Hesaplanmadı", []
+    warnings: list[str] = []
+    stop_coordinates = [
+        (float(stop.latitude), float(stop.longitude))
+        for stop in stops
+    ]
+    try:
+        distances_m = fetch_pedestrian_distance_matrix(
+            stop_coordinates,
+            employee_coordinates,
+            endpoint=endpoint,
+        )
+    except Exception as exc:
+        if not allow_fallback:
+            raise ValueError(
+                "Gerçek yaya yolu mesafeleri alınamadı. Daha sonra tekrar deneyin "
+                "veya yaklaşık yürüme hesabına izin verin."
+            ) from exc
+        warnings.append(
+            f"Yaya yolu verisi alınamadı; %20 güvenlik paylı kuş uçuşu tahminleri kullanıldı ({exc})."
+        )
+        return [
+            CommonStop(
+                anchor_index=stop.anchor_index,
+                member_indices=list(stop.member_indices),
+                walking_distances_m=list(stop.walking_distances_m),
+                latitude=stop.latitude,
+                longitude=stop.longitude,
+                label=stop.label,
+                source=stop.source,
+                matrix_index=stop.matrix_index,
+            )
+            for stop in stops
+        ], "Tahmini yürüme", warnings
+
+    uploaded_sources = {"Yüklenen aday durak", "Onaylı durak", "Önceki plan"}
+    members_by_stop: list[list[int]] = [[] for _ in stops]
+    walks_by_stop: list[list[float]] = [[] for _ in stops]
+    uncovered: list[int] = []
+    for employee_index in range(len(employee_coordinates)):
+        feasible = [
+            stop_index
+            for stop_index in range(len(stops))
+            if distances_m[stop_index][employee_index] <= max_walk_m + 1e-9
+        ]
+        if not feasible:
+            uncovered.append(employee_index)
+            continue
+        uploaded_feasible = [
+            stop_index
+            for stop_index in feasible
+            if stops[stop_index].source in uploaded_sources
+        ]
+        eligible = uploaded_feasible or feasible
+        chosen = min(
+            eligible,
+            key=lambda stop_index: (distances_m[stop_index][employee_index], stop_index),
+        )
+        members_by_stop[chosen].append(employee_index)
+        walks_by_stop[chosen].append(distances_m[chosen][employee_index])
+
+    refined: list[CommonStop] = []
+    for stop_index, stop in enumerate(stops):
+        if not members_by_stop[stop_index]:
+            continue
+        member_walk_pairs = sorted(
+            zip(members_by_stop[stop_index], walks_by_stop[stop_index]),
+            key=lambda pair: (pair[1], pair[0]),
+        )
+        refined.append(
+            CommonStop(
+                anchor_index=stop.anchor_index,
+                member_indices=[pair[0] for pair in member_walk_pairs],
+                walking_distances_m=[pair[1] for pair in member_walk_pairs],
+                latitude=stop.latitude,
+                longitude=stop.longitude,
+                label=stop.label,
+                source=stop.source,
+            )
+        )
+
+    next_anchor = max((stop.anchor_index for stop in stops), default=-1) + 1
+    for offset, employee_index in enumerate(uncovered):
+        latitude, longitude = employee_coordinates[employee_index]
+        refined.append(
+            CommonStop(
+                anchor_index=next_anchor + offset,
+                member_indices=[employee_index],
+                walking_distances_m=[0.0],
+                latitude=float(latitude),
+                longitude=float(longitude),
+                label=f"Yaya yolu sınırı için adres tabanlı aday {employee_index + 1}",
+                source="Çalışan adresi",
+            )
+        )
+    if uncovered:
+        warnings.append(
+            f"{len(uncovered)} çalışan seçili ortak duraklara gerçek yaya yoluyla ulaşamadığı için "
+            "adres tabanlı saha-onay adayına alındı."
+        )
+    return refined, "Valhalla yaya yolu", warnings
+
+
+def split_common_stops_by_capacity(
+    stops: Sequence[CommonStop],
+    capacity: int,
+) -> list[CommonStop]:
+    """Tek fiziksel duraktaki talebi gerektiğinde araç kapasiteli parçalara ayırır."""
+    if capacity <= 0:
+        raise ValueError("Araç kapasitesi sıfırdan büyük olmalıdır.")
+    fragments: list[CommonStop] = []
+    for stop in stops:
+        pairs = list(zip(stop.member_indices, stop.walking_distances_m))
+        part_count = max(1, math.ceil(len(pairs) / capacity))
+        for part_no, start in enumerate(range(0, len(pairs), capacity), start=1):
+            selected = pairs[start : start + capacity]
+            suffix = f" · araç payı {part_no}/{part_count}" if part_count > 1 else ""
+            fragments.append(
+                CommonStop(
+                    anchor_index=stop.anchor_index,
+                    member_indices=[pair[0] for pair in selected],
+                    walking_distances_m=[pair[1] for pair in selected],
+                    latitude=stop.latitude,
+                    longitude=stop.longitude,
+                    label=f"{stop.label}{suffix}",
+                    source=stop.source,
+                )
+            )
+    return fragments
+
+
 def optimize_candidate_stops(
     employee_coordinates: Sequence[tuple[float, float]],
     candidates: Sequence[CandidateStop],
@@ -366,6 +661,37 @@ def optimize_candidate_stops(
     minimum_stop_count = len(selected)
     minimum_proven = status == cp_model.OPTIMAL
 
+    # Aynı minimum durak sayısını sağlayan çözümler arasından toplam yürüyüşü
+    # en düşük olanı seç. İlk model yalnızca durak sayısını küçülttüğü için bu
+    # ikinci aşama olmazsa eşdeğer çözümlerden coğrafi olarak zayıf biri seçilebilir.
+    model.add(sum(selected_vars) == minimum_stop_count)
+    assignment_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    for employee_index, covering in enumerate(eligible_by_employee):
+        employee_assignments = []
+        for candidate_index in covering:
+            variable = model.new_bool_var(f"walk_assign_{candidate_index}_{employee_index}")
+            assignment_vars[(candidate_index, employee_index)] = variable
+            employee_assignments.append(variable)
+            model.add(variable <= selected_vars[candidate_index])
+        model.add(sum(employee_assignments) == 1)
+    model.minimize(
+        sum(
+            int(round(distances_m[candidate_index][employee_index])) * variable
+            for (candidate_index, employee_index), variable in assignment_vars.items()
+        )
+    )
+    walking_solver = cp_model.CpSolver()
+    walking_solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
+    walking_solver.parameters.num_search_workers = 1
+    walking_solver.parameters.random_seed = 42
+    walking_status = walking_solver.solve(model)
+    if walking_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        selected = {
+            index
+            for index, variable in enumerate(selected_vars)
+            if walking_solver.value(variable)
+        }
+
     def walking_assignment(selected_indices: set[int]) -> tuple[list[int], list[float]]:
         assigned: list[int] = []
         walks: list[float] = []
@@ -442,6 +768,8 @@ def update_routes_incrementally(
     mode: str = "auto",
     use_road_network: bool = True,
     allow_automatic_candidates: bool = True,
+    traffic_factor: float = 1.0,
+    allow_approximate_fallback: bool = True,
 ) -> tuple[list[list[CommonStop]], list[list[float]], list[list[float]], dict]:
     """Mevcut durak ve rota yapısını koruyarak yeni çalışanları plana ekler.
 
@@ -605,6 +933,8 @@ def update_routes_incrementally(
     duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
         route_coordinates,
         use_road_network=use_road_network,
+        traffic_factor=traffic_factor,
+        allow_approximate_fallback=allow_approximate_fallback,
     )
 
     def route_total_seconds(route: Sequence[CommonStop]) -> float:
@@ -708,6 +1038,19 @@ def update_routes_incrementally(
             "Yeni otomatik/adres tabanlı durak önerisi var; kullanılmadan önce saha güvenliği onaylanmalıdır."
         )
 
+    audit = validate_route_solution(
+        routes,
+        employee_count=len(employee_coordinates),
+        capacity=capacity,
+        max_walk_m=max_walk_m,
+        duration_matrix=duration_matrix,
+        direction=direction,
+        wait_seconds_per_stop=wait_seconds_per_stop,
+        max_route_minutes=max_route_minutes,
+    )
+    if not audit["valid"]:
+        raise ValueError("Rota kısıt denetimi başarısız: " + " ".join(audit["errors"]))
+
     meta = {
         "vehicle_count": len(routes),
         "candidate_count": candidate_count,
@@ -723,6 +1066,7 @@ def update_routes_incrementally(
         "new_stop_count": len(new_stops),
         "removed_stop_count": max(0, baseline_stop_count - preserved_baseline_stop_count),
         "added_route_count": added_route_count,
+        "audit": audit,
     }
     return routes, duration_matrix, distance_matrix, meta
 
@@ -811,19 +1155,35 @@ def get_travel_matrices(
     coordinates: Sequence[tuple[float, float]],
     use_road_network: bool = True,
     average_speed_kmh: float = 38.0,
+    traffic_factor: float = 1.0,
+    allow_approximate_fallback: bool = True,
 ) -> tuple[list[list[float]], list[list[float]], str, list[str]]:
     """OSRM veya yaklaşık yöntemle rota matrislerini ve kullanıcı uyarılarını döndürür."""
+    if traffic_factor < 1.0:
+        raise ValueError("Trafik katsayısı 1,00 veya daha büyük olmalıdır.")
     warnings: list[str] = []
     if not use_road_network:
         durations, distances = build_estimated_matrices(coordinates, average_speed_kmh)
-        return durations, distances, "Yaklaşık mesafe", warnings
+        durations = scale_duration_matrix(durations, traffic_factor)
+        source = "Yaklaşık mesafe"
+        if traffic_factor > 1.0 + 1e-9:
+            source += f" + %{(traffic_factor - 1) * 100:.0f} süre tamponu"
+        return durations, distances, source, warnings
     try:
         durations, distances = fetch_osrm_table(coordinates)
         source = "OSRM yol ağı"
     except Exception as exc:
+        if not allow_approximate_fallback:
+            raise ValueError(
+                "Gerçek yol ağı verisine ulaşılamadı. Yaklaşık hesaba izin verin "
+                "veya daha sonra yeniden deneyin."
+            ) from exc
         durations, distances = build_estimated_matrices(coordinates, average_speed_kmh)
         source = "Yaklaşık mesafe"
         warnings.append(f"Yol ağı verisi kullanılamadı; yaklaşık mesafeye geçildi ({exc}).")
+    durations = scale_duration_matrix(durations, traffic_factor)
+    if traffic_factor > 1.0 + 1e-9:
+        source += f" + %{(traffic_factor - 1) * 100:.0f} süre tamponu"
     return durations, distances, source, warnings
 
 
@@ -1123,7 +1483,8 @@ def assign_common_stops_to_routes(
     direction: str = "morning",
     wait_seconds_per_stop: int = 45,
     max_route_minutes: float = 0,
-    time_limit_seconds: int = 10,
+    time_limit_seconds: int = 30,
+    compactness_penalty_seconds_per_degree: float = 3.0,
 ) -> list[list[CommonStop]]:
     """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
@@ -1178,7 +1539,42 @@ def assign_common_stops_to_routes(
         return max(0, int(round(drive + service)))
 
     transit_callback = routing.RegisterTransitCallback(travel_seconds)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback)
+
+    # Süre matrisine ek olarak, aynı aracın şehir merkezine göre çok farklı
+    # yönlerdeki duraklar arasında sıçramasını cezalandır. Bu ceza yalnızca amaç
+    # fonksiyonundadır; 120 dakikalık gerçek süre kısıtını yapay biçimde büyütmez.
+    stop_latitudes = [float(coordinates[index][0]) for index in stop_matrix_indices]
+    stop_longitudes = [float(coordinates[index][1]) for index in stop_matrix_indices]
+    center_latitude = sum(stop_latitudes) / len(stop_latitudes)
+    center_longitude = sum(stop_longitudes) / len(stop_longitudes)
+    longitude_scale = math.cos(math.radians(center_latitude))
+    angles_by_full_index = {
+        full_index: math.degrees(
+            math.atan2(
+                float(coordinates[full_index][0]) - center_latitude,
+                (float(coordinates[full_index][1]) - center_longitude) * longitude_scale,
+            )
+        )
+        for full_index in stop_matrix_indices
+    }
+
+    def objective_seconds(from_index: int, to_index: int) -> int:
+        base = travel_seconds(from_index, to_index)
+        from_full = full_matrix_index(manager.IndexToNode(from_index))
+        to_full = full_matrix_index(manager.IndexToNode(to_index))
+        if (
+            compactness_penalty_seconds_per_degree <= 0
+            or from_full not in angles_by_full_index
+            or to_full not in angles_by_full_index
+        ):
+            return base
+        difference = abs(angles_by_full_index[from_full] - angles_by_full_index[to_full])
+        angular_distance = min(difference, 360.0 - difference)
+        penalty = compactness_penalty_seconds_per_degree * angular_distance
+        return max(0, int(round(base + penalty)))
+
+    objective_callback = routing.RegisterTransitCallback(objective_seconds)
+    routing.SetArcCostEvaluatorOfAllVehicles(objective_callback)
 
     demands = [0, *(stop.passenger_count for stop in stops), 0]
 
@@ -1223,6 +1619,69 @@ def assign_common_stops_to_routes(
             index = solution.Value(routing.NextVar(index))
         routes.append(route)
     return routes
+
+
+def validate_route_solution(
+    routes: Sequence[Sequence[CommonStop]],
+    employee_count: int,
+    capacity: int,
+    max_walk_m: float,
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str,
+    wait_seconds_per_stop: int,
+    max_route_minutes: float,
+) -> dict[str, object]:
+    """Rota sonucunun temel operasyonel kısıtlarını bağımsız olarak denetler."""
+    errors: list[str] = []
+    assigned = [
+        employee_index
+        for route in routes
+        for stop in route
+        for employee_index in stop.member_indices
+    ]
+    missing = sorted(set(range(employee_count)) - set(assigned))
+    duplicates = sorted({index for index in assigned if assigned.count(index) > 1})
+    unexpected = sorted({index for index in assigned if not 0 <= index < employee_count})
+    if missing:
+        errors.append(f"{len(missing)} çalışan herhangi bir durağa atanmadı.")
+    if duplicates:
+        errors.append(f"{len(duplicates)} çalışan birden fazla durağa atandı.")
+    if unexpected:
+        errors.append(f"{len(unexpected)} geçersiz çalışan indeksi bulundu.")
+
+    route_checks = []
+    for route_number, route in enumerate(routes, start=1):
+        occupancy = sum(stop.passenger_count for stop in route)
+        max_walk = max((stop.max_walk_m for stop in route), default=0.0)
+        indices = [int(stop.matrix_index) for stop in route]
+        path = [*indices, 0] if direction == "morning" else [0, *indices]
+        drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path, path[1:]))
+        total_minutes = (drive_seconds + len(route) * wait_seconds_per_stop) / 60
+        route_errors = []
+        if occupancy > capacity:
+            route_errors.append(f"kapasite {occupancy}/{capacity}")
+        if max_walk > max_walk_m + 1e-6:
+            route_errors.append(f"yürüme {max_walk:.0f}/{max_walk_m:.0f} m")
+        if max_route_minutes and total_minutes > max_route_minutes + 1e-6:
+            route_errors.append(f"süre {total_minutes:.1f}/{max_route_minutes:.0f} dk")
+        if route_errors:
+            errors.append(f"Rota {route_number}: " + ", ".join(route_errors))
+        route_checks.append(
+            {
+                "route": route_number,
+                "occupancy": occupancy,
+                "max_walk_m": max_walk,
+                "total_minutes": total_minutes,
+                "valid": not route_errors,
+            }
+        )
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "employee_count": employee_count,
+        "assigned_count": len(assigned),
+        "route_checks": route_checks,
+    }
 
 
 def _balanced_sizes(employee_count: int, vehicle_count: int, capacity: int) -> list[int]:

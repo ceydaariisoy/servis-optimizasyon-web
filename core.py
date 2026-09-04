@@ -35,6 +35,57 @@ MIN_HOME_PICKUP_OFFSET_M = 100.0
 CORRIDOR_WALK_FRACTION = 0.65
 ROUTE_CORRIDOR_SOURCE = "Rota üzeri aday durak"
 
+# ============================================================
+# SAHA REFERANS SÜRELERİ (BENCHMARK)
+# ============================================================
+# Mevcut servislerin sahada ölçülen gerçek süreleri optimizasyon
+# için üst sınır/benchmark olarak kullanılır.
+#
+# Sabah: VitrA Karo 1 = 50 dk, Karo 2 = 50 dk, Karo 3 = 57 dk
+# Akşam: VitrA Karo 1 = 80 dk, Karo 2 = 65 dk, Karo 3 = 62 dk
+#
+# Araç sayısı 3'ten fazla olursa yeni araçlar, ilgili yöndeki
+# en yüksek mevcut süreyi referans alır.
+BASELINE_ROUTE_MINUTES = {
+    "morning": [50.0, 50.0, 57.0],
+    "evening": [80.0, 65.0, 62.0],
+}
+
+DEFAULT_EXTRA_ROUTE_LIMIT = {
+    "morning": 57.0,
+    "evening": 80.0,
+}
+
+
+def get_route_time_limits(
+    direction: str,
+    vehicle_count: int,
+    global_max_route_minutes: float = 0,
+) -> list[float]:
+    """Araç bazlı maksimum rota sürelerini döndürür.
+
+    İlk üç araç mevcut saha sürelerini benchmark olarak kullanır.
+    Araç sayısı artarsa ilave araçlar yönün en yüksek benchmark süresini kullanır.
+    ``global_max_route_minutes`` eski uygulama parametresiyle geriye dönük
+    uyumluluk için korunur; pozitifse ayrıca üst sınır olarak uygulanır.
+    """
+    if direction not in {"morning", "evening"}:
+        raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+    if vehicle_count <= 0:
+        raise ValueError("Araç sayısı en az 1 olmalıdır.")
+
+    limits = list(BASELINE_ROUTE_MINUTES[direction])
+    if vehicle_count > len(limits):
+        limits.extend(
+            [DEFAULT_EXTRA_ROUTE_LIMIT[direction]]
+            * (vehicle_count - len(limits))
+        )
+
+    limits = limits[:vehicle_count]
+    if global_max_route_minutes and global_max_route_minutes > 0:
+        limits = [min(limit, float(global_max_route_minutes)) for limit in limits]
+    return limits
+
 
 @dataclass
 class RoutePlan:
@@ -1328,6 +1379,7 @@ def assign_common_stops_to_routes(
     wait_seconds_per_stop: int = 45,
     max_route_minutes: float = 0,
     time_limit_seconds: int = 10,
+    vehicle_time_limits: Sequence[float] | None = None,
 ) -> list[list[CommonStop]]:
     """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
@@ -1398,10 +1450,47 @@ def assign_common_stops_to_routes(
         "Capacity",
     )
 
-    horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
-    routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")
+    # ------------------------------------------------------------
+    # ARAÇ BAZLI SÜRE KISITI
+    # ------------------------------------------------------------
+    # Eski modelde tüm araçlara aynı (çoğunlukla 120 dk) sınır veriliyordu.
+    # Artık her araç kendi mevcut saha benchmarkına göre sınırlandırılıyor.
+    if vehicle_time_limits is None:
+        vehicle_time_limits = get_route_time_limits(
+            direction=direction,
+            vehicle_count=vehicle_count,
+            global_max_route_minutes=max_route_minutes,
+        )
+    else:
+        vehicle_time_limits = [float(value) for value in vehicle_time_limits]
+        if len(vehicle_time_limits) != vehicle_count:
+            raise ValueError(
+                "Araç bazlı süre sınırı sayısı araç sayısıyla eşleşmelidir."
+            )
+        if max_route_minutes and max_route_minutes > 0:
+            vehicle_time_limits = [
+                min(value, float(max_route_minutes))
+                for value in vehicle_time_limits
+            ]
+
+    max_horizon_seconds = int(round(max(vehicle_time_limits) * 60))
+    routing.AddDimension(
+        transit_callback,
+        0,
+        max(1, max_horizon_seconds),
+        True,
+        "Time",
+    )
     time_dimension = routing.GetDimensionOrDie("Time")
-    # Toplam süre yanında en uzun rotayı da kısaltarak araçlar arasında denge kurar.
+
+    # Her aracın kendi saha benchmarkını hard constraint olarak uygula.
+    for vehicle_no, limit_minutes in enumerate(vehicle_time_limits):
+        limit_seconds = int(round(limit_minutes * 60))
+        time_dimension.CumulVar(
+            routing.End(vehicle_no)
+        ).SetMax(limit_seconds)
+
+    # Uygulanabilir çözümler arasında toplam süre ve rota dengesi önemlidir.
     time_dimension.SetGlobalSpanCostCoefficient(3)
 
     parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -1411,9 +1500,11 @@ def assign_common_stops_to_routes(
     parameters.log_search = False
     solution = routing.SolveWithParameters(parameters)
     if solution is None:
-        duration_text = f" ve {max_route_minutes:.0f} dakika sınırına" if max_route_minutes else ""
+        limits_text = "/".join(f"{value:.0f}" for value in vehicle_time_limits)
         raise ValueError(
-            f"{vehicle_count} araç, kapasite{duration_text} göre uygulanabilir rota üretemedi."
+            f"{vehicle_count} araç ve {limits_text} dk araç-bazlı süre sınırları ile "
+            "uygulanabilir rota üretilemedi. Daha fazla araç veya saha benchmarkının "
+            "kontrolü gerekebilir."
         )
 
     routes: list[list[CommonStop]] = []
@@ -1494,6 +1585,7 @@ def plan_routes(
     max_route_minutes: float = 0,
     use_road_network: bool = True,
     average_speed_kmh: float = 32.0,
+    vehicle_time_limits: Sequence[float] | None = None,
 ) -> PlanResult:
     """İlk koordinatı fabrika, diğerlerini çalışan kabul ederek rota üretir."""
     if len(coordinates) < 2:
@@ -1526,15 +1618,34 @@ def plan_routes(
         vehicle_count = minimum_vehicles
 
     while True:
+        # Eski app.py sürümlerinin gönderdiği 120 dk gibi genel değerler
+        # artık saha benchmarkının yerine geçmez.
+        if vehicle_time_limits is not None and len(vehicle_time_limits) == vehicle_count:
+            current_limits = [float(value) for value in vehicle_time_limits]
+        else:
+            current_limits = get_route_time_limits(
+                direction=direction,
+                vehicle_count=vehicle_count,
+                global_max_route_minutes=max_route_minutes,
+            )
+
         clusters = _angular_clusters(
             coordinates, vehicle_count, capacity, duration_matrix, direction
         )
         routes: list[RoutePlan] = []
         for vehicle_no, employee_indices in enumerate(clusters, start=1):
             path = _route_path(employee_indices, direction) if employee_indices else []
-            drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path, path[1:]))
-            distance_meters = sum(distance_matrix[a][b] for a, b in zip(path, path[1:]))
-            total_minutes = drive_seconds / 60 + len(employee_indices) * wait_seconds_per_stop / 60
+            drive_seconds = sum(
+                duration_matrix[a][b] for a, b in zip(path, path[1:])
+            )
+            distance_meters = sum(
+                distance_matrix[a][b] for a, b in zip(path, path[1:])
+            )
+            total_minutes = (
+                drive_seconds / 60
+                + len(employee_indices) * wait_seconds_per_stop / 60
+            )
+            route_limit = current_limits[vehicle_no - 1]
             routes.append(
                 RoutePlan(
                     vehicle_no=vehicle_no,
@@ -1544,17 +1655,38 @@ def plan_routes(
                     distance_km=distance_meters / 1000,
                     drive_minutes=drive_seconds / 60,
                     total_minutes=total_minutes,
-                    exceeds_limit=bool(max_route_minutes and total_minutes > max_route_minutes),
+                    exceeds_limit=total_minutes > route_limit + 1e-9,
                 )
             )
 
         exceeds = any(route.exceeds_limit for route in routes)
-        if mode != "auto" or not max_route_minutes or not exceeds or vehicle_count >= employee_count:
+        if not exceeds:
             break
-        vehicle_count += 1
 
-    if any(route.exceeds_limit for route in routes):
-        warnings.append("Bazı rotalar belirlenen maksimum rota süresini aşıyor.")
+        # Sabit servis modunda benchmarkı aşan sonuç üretme.
+        if mode != "auto":
+            details = ", ".join(
+                f"Servis {route.vehicle_no}: {route.total_minutes:.1f} dk > "
+                f"{current_limits[route.vehicle_no - 1]:.0f} dk"
+                for route in routes
+                if route.exceeds_limit
+            )
+            raise ValueError(
+                "Mevcut saha süreleri korunarak sabit araç sayısıyla uygulanabilir "
+                f"rota üretilemedi ({details}). Otomatik servis sayısını deneyin."
+            )
+
+        if vehicle_count >= employee_count:
+            raise ValueError(
+                "Her çalışan için ayrı araç varsayımında bile saha süre sınırı sağlanamadı. "
+                "Koordinat, durak veya süre benchmarkı kontrol edilmelidir."
+            )
+
+        vehicle_count += 1
+        # Araç sayısı arttığında ilk 3 benchmark korunur; yeni araçlar
+        # yönün ek araç benchmarkını kullanır.
+        vehicle_time_limits = None
+
     return PlanResult(
         routes=routes,
         vehicle_count=vehicle_count,

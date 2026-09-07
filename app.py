@@ -20,7 +20,9 @@ from core import (
 )
 
 
-APP_VERSION = "2026.08.24-professional-ui-v2"
+APP_VERSION = "2026.09.07-route-control-v1"
+MIN_NEW_ROUTE_OCCUPANCY = 0.55
+BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 45
 
@@ -646,14 +648,35 @@ def build_shared_routes(
             f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
         )
 
-    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
-    # sağlanmıyorsa araç sayısı birer artırılır.
+    # Araç sayısı kontrolü: mevcut 3 servis korunur. Otomatik modda yalnızca
+    # 4. servis değerlendirilebilir; 5-6-7 şeklinde sınırsız artış yoktur.
+    # Yeni servis açılırsa her aktif rota en az %55 dolu olmalıdır.
+    if mode == "fixed":
+        candidate_vehicle_counts = [3]
+    else:
+        preferred_count = 3 if minimum_vehicle_count <= 3 else minimum_vehicle_count
+        candidate_vehicle_counts = list(range(preferred_count, min(preferred_count + 1, 4) + 1))
+
     last_error: Exception | None = None
-    maximum_vehicle_count = max(
-        vehicle_count,
-        min(len(all_stops), minimum_vehicle_count + 5),
-    )
-    while vehicle_count <= maximum_vehicle_count:
+    allocated_routes = None
+    for vehicle_count in candidate_vehicle_counts:
+        if vehicle_count < minimum_vehicle_count:
+            continue
+        min_load = (
+            math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
+            if vehicle_count > 3
+            else 0
+        )
+        # Mevcut saha süreleri referans alınır. Yeni 4. servis, yönün en uzun
+        # mevcut servis süresini aşamaz.
+        baseline_limits = list(BASELINE_ROUTE_LIMITS[direction])
+        baseline_max = max(baseline_limits)
+        effective_limit = min(max_route_minutes, baseline_max) if max_route_minutes else baseline_max
+        route_time_limits = [
+            *(baseline_limits[:vehicle_count]),
+            *([baseline_max] * max(0, vehicle_count - len(baseline_limits))),
+        ][:vehicle_count]
+        route_time_limits = [min(limit, effective_limit) for limit in route_time_limits]
         try:
             allocated_routes = assign_common_stops_to_routes(
                 all_stops,
@@ -663,18 +686,20 @@ def build_shared_routes(
                 duration_matrix,
                 direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
-                max_route_minutes=max_route_minutes,
+                max_route_minutes=effective_limit,
+                min_route_occupancy=min_load,
+                route_time_limits=route_time_limits,
             )
             break
         except ValueError as exc:
             last_error = exc
-            if mode == "fixed":
-                raise
-            vehicle_count += 1
-    else:
+            continue
+
+    if allocated_routes is None:
         raise ValueError(
-            "Kapasite ve rota süresi sınırlarını birlikte sağlayan çözüm bulunamadı. "
-            "Azami rota süresini artırın veya kapasiteyi kontrol edin."
+            "3 servis içinde çözüm bulunamadı. 4. servis yalnızca en az "
+            f"%{MIN_NEW_ROUTE_OCCUPANCY * 100:.0f} doluluk ({math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)} kişi) "
+            "sağlanabiliyorsa açılır; bu koşul sağlanmadığı için daha fazla servis oluşturulmadı."
         ) from last_error
 
     shared_routes = materialize_shared_routes(
@@ -848,12 +873,12 @@ with st.sidebar:
         stop_policy_label = st.selectbox(
             "Durak politikası",
             [
-                "Yüklenen durakları kullan; gerekirse yeni aday öner",
                 "Yalnızca yüklenen durakları kullan",
+                "Yüklenen durakları kullan; gerekirse yeni aday öner",
             ],
             help=(
-                "Yeni aday seçeneği çalışan evleri ve yakın evlerin orta noktalarını da değerlendirir. "
-                "Bu noktalar saha onayı olmadan kesin durak değildir."
+                "Varsayılan olarak yalnızca yüklediğiniz duraklar kullanılır. "
+                "Otomatik adaylar yalnızca açıkça seçerseniz devreye girer."
             ),
         )
 
@@ -862,7 +887,7 @@ with st.sidebar:
             "Araç kapasitesi",
             min_value=1,
             max_value=100,
-            value=40,
+            value=45,
             step=1,
         )
         max_walk_m = st.slider(

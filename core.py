@@ -1335,6 +1335,125 @@ def _angular_clusters(
     return best_clusters or [[] for _ in range(vehicle_count)]
 
 
+
+def cluster_stops_geographically(
+    stops: Sequence[CommonStop],
+    factory_coordinates: tuple[float, float],
+    vehicle_count: int,
+    capacity: int,
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str,
+    max_route_minutes: float,
+    wait_seconds_per_stop: int = 45,
+) -> list[list[CommonStop]]:
+    """Mevcut ortak durakları coğrafi olarak bölüp her bölgeyi tek araca optimize eder.
+
+    Global VRP modelinin simetri/arama yükünü azaltmak için durakları önce fabrika
+    etrafında açısal olarak bölümlere ayırır. Durak bölünmez; yolcu yükü bütünlüğü korunur.
+    Birkaç farklı başlangıç noktası denenir ve süre sınırına uyan en dengeli çözüm seçilir.
+    """
+    if not stops:
+        return [[] for _ in range(vehicle_count)]
+    if vehicle_count <= 0 or capacity <= 0:
+        raise ValueError("Araç sayısı ve kapasite pozitif olmalıdır.")
+    total_load = sum(stop.passenger_count for stop in stops)
+    if total_load > vehicle_count * capacity:
+        raise ValueError("Durakların toplam yolcu yükü araç kapasitesini aşıyor.")
+    if any(stop.passenger_count > capacity for stop in stops):
+        raise ValueError("Tek bir duraktaki yolcu sayısı araç kapasitesini aşıyor.")
+
+    depot_lat, depot_lon = factory_coordinates
+    ordered = sorted(
+        range(len(stops)),
+        key=lambda i: math.atan2(
+            float(stops[i].latitude) - depot_lat,
+            float(stops[i].longitude) - depot_lon,
+        ),
+    )
+    if len(ordered) <= 1:
+        return [[stops[i] for i in ordered]] + [[] for _ in range(vehicle_count - 1)]
+
+    def make_groups(rotation: int) -> list[list[int]] | None:
+        seq = ordered[rotation:] + ordered[:rotation]
+        groups: list[list[int]] = []
+        current: list[int] = []
+        current_load = 0
+        target = total_load / vehicle_count
+        remaining_groups = vehicle_count
+        for pos, idx in enumerate(seq):
+            load = stops[idx].passenger_count
+            remaining_load = sum(stops[j].passenger_count for j in seq[pos + 1:])
+            if current and (current_load + load > capacity):
+                groups.append(current)
+                current, current_load = [], 0
+                remaining_groups -= 1
+            if current and remaining_groups > 1 and current_load >= target * 0.82 and remaining_load >= (remaining_groups - 1) * 1:
+                groups.append(current)
+                current, current_load = [], 0
+                remaining_groups -= 1
+            current.append(idx)
+            current_load += load
+        if current:
+            groups.append(current)
+        if len(groups) != vehicle_count or any(sum(stops[i].passenger_count for i in g) > capacity for g in groups):
+            return None
+        return groups
+
+    best: list[list[CommonStop]] | None = None
+    best_score = math.inf
+    max_rotations = min(len(ordered), 80)
+    for rotation in range(max_rotations):
+        groups = make_groups(rotation)
+        if groups is None:
+            continue
+        candidate: list[list[CommonStop]] = []
+        feasible = True
+        durations: list[float] = []
+        for group in groups:
+            group_stops = [stops[i] for i in group]
+            local_coords = [factory_coordinates] + [
+                (float(stop.latitude), float(stop.longitude)) for stop in group_stops
+            ]
+            local_stops = [
+                CommonStop(
+                    anchor_index=stop.anchor_index,
+                    member_indices=list(stop.member_indices),
+                    walking_distances_m=list(stop.walking_distances_m),
+                    latitude=stop.latitude, longitude=stop.longitude,
+                    label=stop.label, source=stop.source, matrix_index=i + 1,
+                )
+                for i, stop in enumerate(group_stops)
+            ]
+            local_matrix = [[0.0 for _ in range(len(local_coords))] for _ in range(len(local_coords))]
+            # duration_matrix indices are the full matrix indices stored on stops.
+            full_indices = [0] + [int(stop.matrix_index) for stop in group_stops]
+            for a, fa in enumerate(full_indices):
+                for b, fb in enumerate(full_indices):
+                    local_matrix[a][b] = duration_matrix[fa][fb]
+            try:
+                routed = assign_common_stops_to_routes(
+                    local_stops, local_coords, 1, capacity, local_matrix, direction,
+                    wait_seconds_per_stop=wait_seconds_per_stop,
+                    max_route_minutes=max_route_minutes,
+                    time_limit_seconds=5,
+                )[0]
+            except ValueError:
+                feasible = False
+                break
+            path = [0] + [s.matrix_index for s in routed] if direction == "evening" else [s.matrix_index for s in routed] + [0]
+            drive = sum(local_matrix[a][b] for a,b in zip(path, path[1:]))
+            total = drive / 60 + len(routed) * wait_seconds_per_stop / 60
+            durations.append(total)
+            original_by_anchor = {stop.anchor_index: stop for stop in group_stops}
+            candidate.append([original_by_anchor[s.anchor_index] for s in routed])
+        if feasible:
+            score = max(durations) * 1000 + sum(durations) + (max(durations) - min(durations)) * 20
+            if score < best_score:
+                best_score, best = score, candidate
+    if best is None:
+        raise ValueError(f"{vehicle_count} coğrafi bölge içinde süre sınırına uyan rota bulunamadı.")
+    return best
+
 def plan_routes(
     coordinates: Sequence[tuple[float, float]],
     capacity: int,

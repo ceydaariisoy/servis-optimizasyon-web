@@ -12,6 +12,7 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    cluster_stops_geographically,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -20,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.07-route-control-v3"
+APP_VERSION = "2026.09.07-route-control-v4"
 MIN_NEW_ROUTE_OCCUPANCY = 0.55
 BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
 FIXED_TARGET_AVERAGE_WALK_M = 400
@@ -672,21 +673,31 @@ def build_shared_routes(
         # tüm yeni rotalar mevcut en uzun hattı aşamaz.
         route_time_limits = [min(baseline_max, effective_limit)] * vehicle_count
         try:
-            allocated_routes = assign_common_stops_to_routes(
-                all_stops,
-                route_coordinates,
-                vehicle_count,
-                capacity,
-                duration_matrix,
-                direction,
-                wait_seconds_per_stop=wait_seconds_per_stop,
-                max_route_minutes=effective_limit,
-                new_route_min_occupancy=(
-                    math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY) if vehicle_count > 3 else 0
-                ),
-                route_time_limits=route_time_limits,
-                time_limit_seconds=30,
-            )
+            # Önce durakları coğrafi bölgelere ayırıyoruz. Böylece OR-Tools tek dev
+            # modelde bütün Eskişehir'i aynı anda dağıtmak yerine her aracın doğal
+            # bölgesini çözüyor; bu, süre sınırı altında çok daha kararlı çalışıyor.
+            if vehicle_count >= 3:
+                allocated_routes = cluster_stops_geographically(
+                    all_stops,
+                    factory_coordinates,
+                    vehicle_count,
+                    capacity,
+                    duration_matrix,
+                    direction,
+                    effective_limit,
+                    wait_seconds_per_stop=wait_seconds_per_stop,
+                )
+                if vehicle_count > 3:
+                    loads = [sum(stop.passenger_count for stop in route) for route in allocated_routes]
+                    if max(loads, default=0) < math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY):
+                        raise ValueError("4 servis senaryosunda en az bir servis 25 kişi doluluk şartını sağlamıyor.")
+            else:
+                allocated_routes = assign_common_stops_to_routes(
+                    all_stops, route_coordinates, vehicle_count, capacity, duration_matrix, direction,
+                    wait_seconds_per_stop=wait_seconds_per_stop, max_route_minutes=effective_limit,
+                    new_route_min_occupancy=(math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY) if vehicle_count > 3 else 0),
+                    route_time_limits=route_time_limits, time_limit_seconds=30,
+                )
             break
         except ValueError as exc:
             last_error = exc

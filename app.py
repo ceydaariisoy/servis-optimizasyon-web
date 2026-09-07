@@ -770,8 +770,10 @@ def build_shared_routes(
         candidate_4 = materialize_shared_routes(
             allocated_4, duration_matrix, distance_matrix, direction, 0
         )
-        if _beats_current_benchmark_with_four(candidate_4, direction):
-            return finish(allocated_4, 4, "duration_optimized_4")
+        # 3 servis mevcut rotalardan daha kısa değilse, ikinci tercih 4 servistir.
+        # Burada 4 servisin de mutlaka eski toplam süreden kısa olması şartı aranmaz:
+        # iş kuralı "önce süreyi kısalt, mümkün değilse en fazla 4 servis" şeklindedir.
+        return finish(allocated_4, 4, "fallback_4_feasible")
     except ValueError:
         allocated_4 = None
 
@@ -798,10 +800,11 @@ def build_shared_routes(
 
     extra_count = sum(stop.passenger_count for stop in dropped_stops)
     if extra_count <= 0:
-        raise ValueError(
-            "3 ve 4 servis çözümleri mevcut rota sürelerinden daha iyi sonuç vermedi. "
-            "Sistem daha uzun bir rotayı otomatik olarak kabul etmez."
-        )
+        # Buraya yalnızca 4 araçlık tam çözüm de üretilemediğinde gelinir.
+        # 3 ana servisin tamamı çalışanları kapsıyorsa, aslında ek servis gerekmiyor;
+        # bu durumda mevcut 3 servis çözümünü döndürmek, hatalı bir "ek servis"
+        # üretmekten daha doğrudur.
+        return finish(allocated_main, 3, "feasible_3_not_better")
 
     # Açıkta kalan durakları tek ve küçük bir ek servis olarak çöz.
     extra_capacity = max(capacity, extra_count)

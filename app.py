@@ -648,13 +648,12 @@ def build_shared_routes(
             f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
         )
 
-    # Araç sayısı kontrolü: mevcut 3 servis korunur. Otomatik modda yalnızca
-    # 4. servis değerlendirilebilir; 5-6-7 şeklinde sınırsız artış yoktur.
-    # Yeni servis açılırsa her aktif rota en az %55 dolu olmalıdır.
+    # Önce 3 servis denenir. Yeni servis gerekiyorsa yalnızca yeni açılan
+    # servis %55 (45 kapasitede 25 kişi) minimum doluluk şartına tabidir.
     if mode == "fixed":
         candidate_vehicle_counts = [3]
     else:
-        preferred_count = 3 if minimum_vehicle_count <= 3 else minimum_vehicle_count
+        preferred_count = max(3, minimum_vehicle_count)
         min_new_route_load = math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
         max_by_occupancy = len(employees) // min_new_route_load
         maximum_vehicle_count = max(minimum_vehicle_count, max_by_occupancy)
@@ -665,21 +664,11 @@ def build_shared_routes(
     for vehicle_count in candidate_vehicle_counts:
         if vehicle_count < minimum_vehicle_count:
             continue
-        min_load = (
-            math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
-            if vehicle_count > 3
-            else 0
-        )
-        # Mevcut saha süreleri referans alınır. Yeni 4. servis, yönün en uzun
-        # mevcut servis süresini aşamaz.
-        baseline_limits = list(BASELINE_ROUTE_LIMITS[direction])
-        baseline_max = max(baseline_limits)
+        baseline_max = max(BASELINE_ROUTE_LIMITS[direction])
         effective_limit = min(max_route_minutes, baseline_max) if max_route_minutes else baseline_max
-        route_time_limits = [
-            *(baseline_limits[:vehicle_count]),
-            *([baseline_max] * max(0, vehicle_count - len(baseline_limits))),
-        ][:vehicle_count]
-        route_time_limits = [min(limit, effective_limit) for limit in route_time_limits]
+        # Mevcut hatların 50/50/57 veya 80/65/62 sırasını zorlamıyoruz;
+        # tüm yeni rotalar mevcut en uzun hattı aşamaz.
+        route_time_limits = [min(baseline_max, effective_limit)] * vehicle_count
         try:
             allocated_routes = assign_common_stops_to_routes(
                 all_stops,
@@ -690,7 +679,9 @@ def build_shared_routes(
                 direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=effective_limit,
-                min_route_occupancy=min_load,
+                new_route_min_occupancy=(
+                    math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY) if vehicle_count > 3 else 0
+                ),
                 route_time_limits=route_time_limits,
             )
             break
@@ -700,9 +691,9 @@ def build_shared_routes(
 
     if allocated_routes is None:
         raise ValueError(
-            "3 servis içinde çözüm bulunamadı. 4. servis yalnızca en az "
-            f"%{MIN_NEW_ROUTE_OCCUPANCY * 100:.0f} doluluk ({math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)} kişi) "
-            "sağlanabiliyorsa açılır; bu koşul sağlanmadığı için daha fazla servis oluşturulmadı."
+            "3 servis mevcut süre sınırları içinde çözülemedi. "
+            "Yeni servis yalnızca en az %55 doluluk (25 kişi) ile açılabilir. "
+            "1000 m yürüme sınırı ve yüklenen durak önceliği korunarak uygulanabilir plan bulunamadı."
         ) from last_error
 
     shared_routes = materialize_shared_routes(
@@ -1162,7 +1153,7 @@ employees = st.session_state["result_employees"]
 factory_lat, factory_lon, factory_address = st.session_state["result_factory"]
 result_direction = st.session_state["result_direction"]
 result_capacity = st.session_state["result_capacity"]
-result_max_walk_m = st.session_state.get("result_max_walk_m", 500)
+result_max_walk_m = st.session_state.get("result_max_walk_m", 1000)
 direction = "morning" if result_direction.startswith("Sabah") else "evening"
 shared_routes = st.session_state.get("shared_routes")
 if shared_routes is None:

@@ -1142,6 +1142,7 @@ def assign_common_stops_to_routes(
     time_limit_seconds: int = 10,
     min_route_occupancy: int = 0,
     route_time_limits: Sequence[float] | None = None,
+    new_route_min_occupancy: int = 0,
 ) -> list[list[CommonStop]]:
     """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
@@ -1219,6 +1220,13 @@ def assign_common_stops_to_routes(
             capacity_dimension.CumulVar(routing.End(vehicle)).SetRange(
                 min_route_occupancy, capacity
             )
+    if new_route_min_occupancy > 0:
+        if new_route_min_occupancy > capacity:
+            raise ValueError("Yeni rota minimum doluluğu araç kapasitesini aşamaz.")
+        # 4+ araçlı çözümde yalnızca son araç yeni servis olarak değerlendirilir.
+        capacity_dimension.CumulVar(routing.End(vehicle_count - 1)).SetRange(
+            new_route_min_occupancy, capacity
+        )
 
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
     routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")

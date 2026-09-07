@@ -219,13 +219,32 @@ def generate_candidate_stops(
 
     raw_candidates: list[CandidateStop] = []
     if allow_automatic_candidates:
+        # Çalışanın ev koordinatını doğrudan durak olarak kullanma.
+        # İzole kalan çalışan için, fabrika yönünde küçük bir mesafe ötelenmiş
+        # bir aday üretiriz. Böylece aday evin üzerinde değil, servis güzergâhına
+        # daha yakın bir buluşma noktası olarak değerlendirilir.
         for index, (lat, lon) in enumerate(employee_coordinates, start=1):
+            factory_hint = getattr(generate_candidate_stops, "_factory_hint", None)
+            if factory_hint is not None:
+                f_lat, f_lon = factory_hint
+                dlat = float(f_lat) - float(lat)
+                dlon = float(f_lon) - float(lon)
+                norm = (dlat * dlat + dlon * dlon) ** 0.5
+                if norm > 1e-12:
+                    # Yaklaşık 150 m fabrika yönüne; ev koordinatından ayrılır.
+                    step = min(150.0 / 111_000.0 / norm, 1.0)
+                    candidate_lat = float(lat) + dlat * step
+                    candidate_lon = float(lon) + dlon * step
+                else:
+                    candidate_lat, candidate_lon = float(lat), float(lon)
+            else:
+                candidate_lat, candidate_lon = float(lat), float(lon)
             raw_candidates.append(
                 CandidateStop(
-                    float(lat),
-                    float(lon),
-                    f"Adres tabanlı yedek durak {index}",
-                    "Çalışan adresi",
+                    candidate_lat,
+                    candidate_lon,
+                    f"Otomatik güzergâh adayı {index}",
+                    "Otomatik güzergâh adayı",
                 )
             )
 
@@ -265,7 +284,7 @@ def generate_candidate_stops(
         "Yüklenen aday durak": 0,
         "Onaylı durak": 0,
         "Otomatik ortak nokta": 1,
-        "Çalışan adresi": 2,
+        "Otomatik güzergâh adayı": 2,
     }
     best_by_coverage: dict[tuple[int, ...], tuple[tuple[int, float], CandidateStop]] = {}
     for candidate in raw_candidates:
@@ -462,6 +481,9 @@ def optimize_service_network(
     if direction not in {"morning", "evening"}:
         raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
 
+    # Aday üretiminde çalışan evinden doğrudan durak açmamak için fabrika yönünü
+    # geçici bir ipucu olarak kullan.
+    generate_candidate_stops._factory_hint = factory_coordinates
     candidates = generate_candidate_stops(
         employee_coordinates,
         max_walk_m=max_walk_m,
@@ -486,8 +508,12 @@ def optimize_service_network(
     ]
     uncovered = [i for i, covering in enumerate(cover_by_employee) if not covering]
     if uncovered:
+        employee_numbers = ", ".join(str(i + 1) for i in uncovered[:20])
+        suffix = "..." if len(uncovered) > 20 else ""
         raise ValueError(
-            f"{len(uncovered)} çalışan için 1000 metre içinde erişilebilir durak bulunamadı."
+            f"{len(uncovered)} çalışan için 1000 metre içinde erişilebilir durak bulunamadı "
+            f"(çalışan sıra no: {employee_numbers}{suffix}). "
+            "Yeni otomatik güzergâh adayları üretilemedi; koordinatları kontrol edin."
         )
 
     uploaded_sources = {"Yüklenen aday durak", "Onaylı durak"}

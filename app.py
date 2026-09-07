@@ -799,12 +799,12 @@ with st.sidebar:
         stop_policy_label = st.selectbox(
             "Durak politikası",
             [
-                "Yalnızca yüklenen durakları kullan",
                 "Yüklenen durakları kullan; gerekirse yeni aday öner",
+                "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Varsayılan olarak yalnızca yüklediğiniz duraklar kullanılır. "
-                "Otomatik adaylar yalnızca açıkça seçerseniz devreye girer."
+                "Yüklenen duraklar önceliklidir. Uygun değilse sistem 1000 m sınırı içinde "
+                "yeni güzergâh adayları üretir; çalışan adresi doğrudan durak olarak kullanılmaz."
             ),
         )
 

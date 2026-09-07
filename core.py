@@ -23,6 +23,7 @@ from ortools.sat.python import cp_model
 
 
 EARTH_RADIUS_KM = 6371.0088
+DEFAULT_MAX_WALK_M = 1000.0
 ESKISEHIR_CENTER = (39.7767, 30.5206)
 ESKISEHIR_MAX_DISTANCE_KM = 55.0
 MIN_NEW_ROUTE_OCCUPANCY = 0.55
@@ -102,7 +103,7 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 def cluster_common_stops(
     coordinates: Sequence[tuple[float, float]],
-    max_walk_m: float = 500.0,
+    max_walk_m: float = DEFAULT_MAX_WALK_M,
     capacity: int | None = None,
     walking_factor: float = 1.20,
     time_limit_seconds: int = 15,
@@ -200,7 +201,7 @@ def cluster_common_stops(
 
 def generate_candidate_stops(
     employee_coordinates: Sequence[tuple[float, float]],
-    max_walk_m: float = 500.0,
+    max_walk_m: float = DEFAULT_MAX_WALK_M,
     walking_factor: float = 1.20,
     approved_candidates: Sequence[tuple[float, float, str]] | None = None,
     allow_automatic_candidates: bool = True,
@@ -218,17 +219,6 @@ def generate_candidate_stops(
         raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
 
     raw_candidates: list[CandidateStop] = []
-    if allow_automatic_candidates:
-        for index, (lat, lon) in enumerate(employee_coordinates, start=1):
-            raw_candidates.append(
-                CandidateStop(
-                    float(lat),
-                    float(lon),
-                    f"Adres tabanlı yedek durak {index}",
-                    "Çalışan adresi",
-                )
-            )
-
     approved_candidates = approved_candidates or []
     for index, (lat, lon, label) in enumerate(approved_candidates, start=1):
         raw_candidates.append(
@@ -241,10 +231,34 @@ def generate_candidate_stops(
         )
 
     if allow_automatic_candidates:
+        # Otomatik adaylar tüm çalışanlar için körlemesine üretilmez.
+        # Önce yüklenen durakların kapsaması hesaplanır; yalnızca 1000 m içinde
+        # yüklenmiş durağı olmayan çalışanlar için yedek aday üretilir.
+        uploaded_points = [(float(lat), float(lon)) for lat, lon, _ in approved_candidates]
+        uncovered_indices = []
+        for employee_index, employee in enumerate(employee_coordinates):
+            covered = any(
+                haversine_km(point, employee) * 1000 * walking_factor <= max_walk_m + 1e-9
+                for point in uploaded_points
+            )
+            if not covered:
+                uncovered_indices.append(employee_index)
+
+        for employee_index in uncovered_indices:
+            lat, lon = employee_coordinates[employee_index]
+            raw_candidates.append(
+                CandidateStop(
+                    float(lat),
+                    float(lon),
+                    f"Adres tabanlı yedek durak {employee_index + 1}",
+                    "Çalışan adresi",
+                )
+            )
+
         straight_radius_m = max_walk_m / walking_factor
         midpoint_no = 1
-        for first in range(len(employee_coordinates)):
-            for second in range(first + 1, len(employee_coordinates)):
+        for pos, first in enumerate(uncovered_indices):
+            for second in uncovered_indices[pos + 1:]:
                 if (
                     haversine_km(employee_coordinates[first], employee_coordinates[second]) * 1000
                     <= 2 * straight_radius_m + 1e-9
@@ -286,7 +300,7 @@ def generate_candidate_stops(
 def optimize_candidate_stops(
     employee_coordinates: Sequence[tuple[float, float]],
     candidates: Sequence[CandidateStop],
-    max_walk_m: float = 500.0,
+    max_walk_m: float = DEFAULT_MAX_WALK_M,
     target_average_walk_m: float = 300.0,
     walking_factor: float = 1.20,
     time_limit_seconds: int = 8,
@@ -434,7 +448,7 @@ def update_routes_incrementally(
     baseline_routes: Sequence[Sequence[CommonStop]],
     factory_coordinates: tuple[float, float],
     approved_candidates: Sequence[tuple[float, float, str]] | None = None,
-    max_walk_m: float = 500.0,
+    max_walk_m: float = DEFAULT_MAX_WALK_M,
     target_average_walk_m: float = 300.0,
     walking_factor: float = 1.20,
     capacity: int = 40,

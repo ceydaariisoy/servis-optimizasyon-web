@@ -20,7 +20,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.07-route-control-v1"
+APP_VERSION = "2026.09.07-route-control-v2"
 MIN_NEW_ROUTE_OCCUPANCY = 0.55
 BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
 FIXED_TARGET_AVERAGE_WALK_M = 400
@@ -655,7 +655,10 @@ def build_shared_routes(
         candidate_vehicle_counts = [3]
     else:
         preferred_count = 3 if minimum_vehicle_count <= 3 else minimum_vehicle_count
-        candidate_vehicle_counts = list(range(preferred_count, min(preferred_count + 1, 4) + 1))
+        min_new_route_load = math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
+        max_by_occupancy = len(employees) // min_new_route_load
+        maximum_vehicle_count = max(minimum_vehicle_count, max_by_occupancy)
+        candidate_vehicle_counts = list(range(preferred_count, maximum_vehicle_count + 1))
 
     last_error: Exception | None = None
     allocated_routes = None
@@ -873,12 +876,13 @@ with st.sidebar:
         stop_policy_label = st.selectbox(
             "Durak politikası",
             [
+                "Yüklenen durakları esas al; yalnızca gerektiğinde yeni aday üret",
                 "Yalnızca yüklenen durakları kullan",
-                "Yüklenen durakları kullan; gerekirse yeni aday öner",
             ],
             help=(
-                "Varsayılan olarak yalnızca yüklediğiniz duraklar kullanılır. "
-                "Otomatik adaylar yalnızca açıkça seçerseniz devreye girer."
+                "Yüklediğiniz duraklar önceliklidir. Bir çalışan 1000 m içinde "
+                "yüklenmiş bir durağa erişemiyorsa yalnızca bu çalışanları kapsamak "
+                "için otomatik yedek aday üretilir."
             ),
         )
 
@@ -894,7 +898,7 @@ with st.sidebar:
             "Azami yürüme mesafesi",
             min_value=200,
             max_value=1200,
-            value=500,
+            value=1000,
             step=50,
             format="%d m",
             help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",

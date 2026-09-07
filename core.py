@@ -1148,7 +1148,8 @@ def assign_common_stops_to_routes(
 
     Model, durakları araçlara atama ve her aracın durak sırasını aynı anda çözer.
     Sabah rotaları serbest bir ilk duraktan başlayıp fabrikada, akşam rotaları
-    fabrikada başlayıp serbest bir son durakta biter.
+    fabrikada başlayıp serbest bir son durakta biter. 4 araçlı senaryoda yalnızca
+    son araç yeni servis kabul edilir ve minimum doluluk kuralı sadece ona uygulanır.
     """
     if direction not in {"morning", "evening"}:
         raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
@@ -1224,9 +1225,14 @@ def assign_common_stops_to_routes(
         if new_route_min_occupancy > capacity:
             raise ValueError("Yeni rota minimum doluluğu araç kapasitesini aşamaz.")
         # 4+ araçlı çözümde yalnızca son araç yeni servis olarak değerlendirilir.
-        capacity_dimension.CumulVar(routing.End(vehicle_count - 1)).SetRange(
+        new_vehicle = vehicle_count - 1
+        capacity_dimension.CumulVar(routing.End(new_vehicle)).SetRange(
             new_route_min_occupancy, capacity
         )
+        # Araçların simetrik olmasından dolayı yeni servis kuralının boşa çıkmaması için
+        # yeni araç en az bir durak ziyaret etmek zorundadır. Doluluk alt sınırı zaten
+        # 25 kişi olduğundan bu kısıt sadece çözücünün gereksiz boş araç kullanmasını önler.
+        routing.ActiveVehicleVar(new_vehicle).SetValue(1)
 
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
     routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")

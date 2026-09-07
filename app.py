@@ -20,7 +20,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.07-route-control-v2"
+APP_VERSION = "2026.09.07-route-control-v3"
 MIN_NEW_ROUTE_OCCUPANCY = 0.55
 BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
 FIXED_TARGET_AVERAGE_WALK_M = 400
@@ -656,7 +656,9 @@ def build_shared_routes(
         preferred_count = max(3, minimum_vehicle_count)
         min_new_route_load = math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
         max_by_occupancy = len(employees) // min_new_route_load
-        maximum_vehicle_count = max(minimum_vehicle_count, max_by_occupancy)
+        # İş kuralı: mevcut 3 servis korunur; yalnızca gerektiğinde 1 yeni servis açılır.
+        # Böylece optimizasyon 5/6/7 düşük doluluklu servisler üretemez.
+        maximum_vehicle_count = min(4, max(minimum_vehicle_count, max_by_occupancy))
         candidate_vehicle_counts = list(range(preferred_count, maximum_vehicle_count + 1))
 
     last_error: Exception | None = None
@@ -690,10 +692,12 @@ def build_shared_routes(
             continue
 
     if allocated_routes is None:
+        detail = str(last_error) if last_error else "Optimizasyon çözücü uygulanabilir rota bulamadı."
         raise ValueError(
             "3 servis mevcut süre sınırları içinde çözülemedi. "
-            "Yeni servis yalnızca en az %55 doluluk (25 kişi) ile açılabilir. "
-            "1000 m yürüme sınırı ve yüklenen durak önceliği korunarak uygulanabilir plan bulunamadı."
+            "Gerektiğinde yalnızca 4. servis denenebilir ve bu servis en az %55 dolu (25 kişi) olmalıdır. "
+            "5. ve üzeri servis açılmaz. 1000 m yürüme sınırı ve yüklenen durak önceliği korunur. "
+            f"Son teknik neden: {detail}"
         ) from last_error
 
     shared_routes = materialize_shared_routes(

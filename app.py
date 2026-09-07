@@ -16,296 +16,30 @@ from core import (
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
-    optimize_service_network,
     update_routes_incrementally,
 )
 
 
-APP_VERSION = "2026.09.07-route-control-v1"
-MIN_NEW_ROUTE_OCCUPANCY = 0.55
-BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
-FIXED_TARGET_AVERAGE_WALK_M = 400
-FIXED_WAIT_SECONDS_PER_STOP = 45
-
-
-st.set_page_config(
-    page_title="Servis Rota Optimizasyonu",
-    page_icon="🚌",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Servis Rota Optimizasyonu", page_icon="🚌", layout="wide")
 
 st.markdown(
     """
     <style>
-    :root {
-        --navy: #17324D;
-        --blue: #285A84;
-        --blue-soft: #EAF1F7;
-        --ink: #1F2937;
-        --muted: #667085;
-        --line: #DCE3EA;
-        --surface: #FFFFFF;
-        --background: #F6F8FA;
-        --success: #147D64;
-    }
-
-    .stApp {background: var(--background);}
-    .block-container {
-        max-width: 1480px;
-        padding-top: 1.4rem;
-        padding-bottom: 4rem;
-    }
-    #MainMenu, footer {visibility: hidden;}
-    [data-testid="stToolbar"] {display: none;}
-    [data-testid="stSidebar"] {
-        background: #F1F4F7;
-        border-right: 1px solid var(--line);
-    }
-    [data-testid="stSidebarContent"] {padding-top: 1.1rem;}
-    [data-testid="stSidebar"] hr {margin: 0.9rem 0;}
-    [data-testid="stSidebar"] .stCaption {color: #687587;}
-
-    .app-hero {
-        display: flex;
-        align-items: center;
-        gap: 1.15rem;
-        padding: 1.35rem 1.5rem;
-        margin-bottom: 1.6rem;
-        background: linear-gradient(120deg, #FFFFFF 0%, #F3F7FA 100%);
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        box-shadow: 0 10px 30px rgba(23, 50, 77, 0.06);
-    }
-    .hero-icon {
-        width: 54px;
-        height: 54px;
-        flex: 0 0 54px;
-        display: grid;
-        place-items: center;
-        background: var(--navy);
-        border-radius: 14px;
-        color: #FFFFFF;
-    }
-    .hero-kicker {
-        color: var(--blue);
-        font-size: 0.72rem;
-        font-weight: 750;
-        letter-spacing: 0.11em;
-        margin-bottom: 0.18rem;
-    }
-    .app-hero h1 {
-        color: var(--ink);
-        font-size: clamp(1.75rem, 3vw, 2.45rem);
-        line-height: 1.15;
-        letter-spacing: -0.025em;
-        margin: 0;
-    }
-    .app-hero p {
-        color: var(--muted);
-        font-size: 0.98rem;
-        line-height: 1.55;
-        margin: 0.4rem 0 0;
-    }
-
-    .section-heading {
-        display: flex;
-        align-items: flex-start;
-        gap: 0.85rem;
-        margin: 1.75rem 0 0.85rem;
-    }
-    .step-badge {
-        min-width: 38px;
-        height: 30px;
-        display: grid;
-        place-items: center;
-        color: var(--blue);
-        background: var(--blue-soft);
-        border-radius: 9px;
-        font-size: 0.76rem;
-        font-weight: 800;
-        letter-spacing: 0.04em;
-    }
-    .section-heading h2 {
-        color: var(--ink);
-        font-size: 1.3rem;
-        line-height: 1.25;
-        margin: 0;
-    }
-    .section-heading p {
-        color: var(--muted);
-        font-size: 0.88rem;
-        line-height: 1.45;
-        margin: 0.18rem 0 0;
-    }
-
-    .sidebar-brand {
-        padding: 0.35rem 0 0.7rem;
-    }
-    .sidebar-brand strong {
-        display: block;
-        color: var(--navy);
-        font-size: 1.08rem;
-    }
-    .sidebar-brand span {
-        color: var(--muted);
-        font-size: 0.79rem;
-    }
-    .sidebar-note {
-        color: #607083;
-        background: #FFFFFF;
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        padding: 0.7rem 0.8rem;
-        font-size: 0.78rem;
-        line-height: 1.45;
-        margin-top: 0.6rem;
-    }
-
-    div[data-testid="stMetric"] {
-        min-height: 104px;
-        background: var(--surface);
-        border: 1px solid var(--line);
-        border-radius: 13px;
-        padding: 0.9rem 1rem;
-        box-shadow: 0 4px 14px rgba(23, 50, 77, 0.035);
-    }
-    div[data-testid="stMetric"] label {
-        color: var(--muted);
-        font-size: 0.82rem;
-        font-weight: 600;
-    }
-    div[data-testid="stMetricValue"] {
-        color: var(--navy);
-        font-size: 1.75rem;
-    }
-    [data-testid="stFileUploader"] {
-        background: var(--surface);
-        border: 1px solid var(--line);
-        border-radius: 13px;
-        padding: 0.85rem 1rem 0.35rem;
-    }
-    [data-testid="stFileUploaderDropzone"] {
-        background: #FAFBFC;
-        border-color: #B9C7D4;
-        border-radius: 10px;
-    }
-    [data-testid="stExpander"] {
-        background: var(--surface);
-        border-color: var(--line);
-        border-radius: 11px;
-    }
-    [data-testid="stAlert"] {border-radius: 11px;}
-    .stButton > button[kind="primary"],
-    .stDownloadButton > button[kind="primary"] {
-        min-height: 2.85rem;
-        background: var(--navy);
-        border-color: var(--navy);
-        border-radius: 10px;
-        font-weight: 700;
-        box-shadow: 0 6px 16px rgba(23, 50, 77, 0.14);
-    }
-    .stButton > button[kind="primary"]:hover,
-    .stDownloadButton > button[kind="primary"]:hover {
-        background: #214767;
-        border-color: #214767;
-    }
-
-    .route-card {
-        background: var(--surface);
-        border: 1px solid var(--line);
-        border-left: 5px solid var(--blue);
-        padding: 1rem 1.15rem;
-        border-radius: 13px;
-        margin: 0.85rem 0 0.55rem;
-        box-shadow: 0 5px 16px rgba(23, 50, 77, 0.04);
-    }
-    .route-card-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        margin-bottom: 0.85rem;
-    }
-    .route-title {
-        color: var(--navy);
-        font-size: 1rem;
-        font-weight: 800;
-    }
-    .route-occupancy {
-        color: var(--blue);
-        background: var(--blue-soft);
-        border-radius: 999px;
-        padding: 0.3rem 0.65rem;
-        font-size: 0.76rem;
-        font-weight: 750;
-        white-space: nowrap;
-    }
-    .route-stat-grid {
-        display: grid;
-        grid-template-columns: repeat(5, minmax(80px, 1fr));
-        gap: 0.75rem;
-    }
-    .route-stat strong {
-        display: block;
-        color: var(--ink);
-        font-size: 0.92rem;
-    }
-    .route-stat span {
-        color: var(--muted);
-        font-size: 0.72rem;
-    }
-    .muted {color: var(--muted); font-size: 0.92rem;}
-
-    @media (max-width: 900px) {
-        .app-hero {padding: 1.1rem;}
-        .hero-icon {width: 46px; height: 46px; flex-basis: 46px;}
-        .route-stat-grid {grid-template-columns: repeat(2, 1fr);}
-    }
+    .block-container {padding-top: 2rem; padding-bottom: 3rem;}
+    div[data-testid="stMetric"] {background:#F5F7FA; border:1px solid #E2E8F0; padding:14px; border-radius:12px;}
+    .route-card {background:#FFFFFF; border:1px solid #E2E8F0; border-left:6px solid #285A84;
+                 padding:16px 18px; border-radius:12px; margin:10px 0;}
+    .muted {color:#64748B; font-size:0.92rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="app-hero">
-        <div class="hero-icon" aria-hidden="true">
-            <svg width="29" height="29" viewBox="0 0 24 24" fill="none"
-                 xmlns="http://www.w3.org/2000/svg">
-                <path d="M4 17.5V8.8C4 6.7 5.7 5 7.8 5h8.4C18.3 5 20 6.7 20 8.8v8.7"
-                      stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
-                <path d="M4 14.5h16M7 9h3.2M13.8 9H17"
-                      stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
-                <circle cx="7" cy="18" r="1.7" fill="currentColor"/>
-                <circle cx="17" cy="18" r="1.7" fill="currentColor"/>
-            </svg>
-        </div>
-        <div>
-            <div class="hero-kicker">OPERASYON PLANLAMA</div>
-            <h1>Servis Rota Optimizasyonu</h1>
-            <p>Çalışan ve durak verilerini yükleyin; kapasite, süre ve yürüme
-               kısıtlarına göre uygulanabilir servis rotalarını oluşturun.</p>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+st.title("🚌 Servis Rota Optimizasyonu")
+st.caption(
+    "Enlem ve boylam içeren Excel'i yükleyin; sistem minimum servis sayısını, "
+    "ortak buluşma duraklarını, durak sırasını ve güzergâhları oluştursun."
 )
-
-
-def section_header(step: str, title: str, description: str) -> None:
-    st.markdown(
-        f"""
-        <div class="section-heading">
-            <div class="step-badge">{step}</div>
-            <div>
-                <h2>{title}</h2>
-                <p>{description}</p>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 FACTORY_ADDRESS = (
@@ -367,7 +101,7 @@ def get_mapping(df: pd.DataFrame):
             st.warning(f"'{label}' alanını seçmelisiniz.")
         return None if value == none_label else value
 
-    with st.expander("Gelişmiş: Excel sütun eşleştirmesini kontrol et", expanded=False):
+    with st.expander("Excel sütunlarını kontrol et", expanded=False):
         c1, c2, c3 = st.columns(3)
         with c1:
             id_col = select("Çalışan / sicil no", "id")
@@ -615,19 +349,70 @@ def build_shared_routes(
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
 ):
-    """Kullanıcının gerçek kısıtlarını birlikte optimize eden tam rota planı."""
+    """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
-    allocated_routes, duration_matrix, distance_matrix, meta = optimize_service_network(
-        employee_coordinates=employee_coordinates,
-        factory_coordinates=factory_coordinates,
+    candidates = generate_candidate_stops(
+        employee_coordinates,
         max_walk_m=max_walk_m,
-        capacity=capacity,
-        direction=direction,
+        walking_factor=1.20,
         approved_candidates=approved_candidates,
         allow_automatic_candidates=allow_automatic_candidates,
-        wait_seconds_per_stop=wait_seconds_per_stop,
+    )
+    all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
+        employee_coordinates,
+        candidates,
+        max_walk_m=max_walk_m,
+        target_average_walk_m=target_average_walk_m,
+        walking_factor=1.20,
+    )
+    route_coordinates = [
+        factory_coordinates,
+        *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
+    ]
+    for matrix_index, stop in enumerate(all_stops, start=1):
+        stop.matrix_index = matrix_index
+    duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
+        route_coordinates,
         use_road_network=use_road_network,
     )
+
+    minimum_vehicle_count = math.ceil(len(employees) / capacity)
+    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
+    if vehicle_count < minimum_vehicle_count:
+        raise ValueError(
+            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
+        )
+
+    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
+    # sağlanmıyorsa araç sayısı birer artırılır.
+    last_error: Exception | None = None
+    maximum_vehicle_count = max(
+        vehicle_count,
+        min(len(all_stops), minimum_vehicle_count + 5),
+    )
+    while vehicle_count <= maximum_vehicle_count:
+        try:
+            allocated_routes = assign_common_stops_to_routes(
+                all_stops,
+                route_coordinates,
+                vehicle_count,
+                capacity,
+                duration_matrix,
+                direction,
+                wait_seconds_per_stop=wait_seconds_per_stop,
+                max_route_minutes=max_route_minutes,
+            )
+            break
+        except ValueError as exc:
+            last_error = exc
+            if mode == "fixed":
+                raise
+            vehicle_count += 1
+    else:
+        raise ValueError(
+            "Kapasite ve rota süresi sınırlarını birlikte sağlayan çözüm bulunamadı. "
+            "Azami rota süresini artırın veya kapasiteyi kontrol edin."
+        ) from last_error
 
     shared_routes = materialize_shared_routes(
         allocated_routes,
@@ -636,19 +421,20 @@ def build_shared_routes(
         direction,
         wait_seconds_per_stop,
     )
-
-    meta["selected_stop_count"] = sum(len(route) for route in allocated_routes)
-    meta["minimum_stop_count"] = meta.get("selected_stop_count", 0)
-    meta["minimum_proven"] = False
-    if any(
-        stop.source in {"Otomatik ortak nokta", "Çalışan adresi"}
-        for route in allocated_routes
-        for stop in route
-    ):
-        meta.setdefault("warnings", []).append(
-            "Otomatik/adres tabanlı duraklar güzergâh optimizasyonu için önerilmiştir; "
-            "uygulama öncesi saha güvenliği ve durak uygunluğu kontrol edilmelidir."
+    if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
+        warnings.append(
+            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
         )
+    meta = {
+        "vehicle_count": vehicle_count,
+        "candidate_count": len(candidates),
+        "minimum_stop_count": minimum_stop_count,
+        "minimum_proven": minimum_proven,
+        "selected_stop_count": len(all_stops),
+        "matrix_source": matrix_source,
+        "warnings": warnings,
+        "planning_mode": "full",
+    }
     return shared_routes, meta
 
 
@@ -773,121 +559,93 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
 
 
 with st.sidebar:
-    st.markdown(
-        """
-        <div class="sidebar-brand">
-            <strong>Planlama Ayarları</strong>
-            <span>Optimizasyon kısıtlarını belirleyin</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.header("Planlama ayarları")
+    planning_label = st.radio(
+        "Planlama yaklaşımı",
+        ["Tam optimizasyon", "Mevcut planı koruyarak güncelle"],
+        help=(
+            "Tam optimizasyon bütün planı yeniden kurar. Mevcut planı koruma modu "
+            "önce yeni çalışanı mevcut durağa ekler ve yalnızca gerekirse yeni durak/rota açar."
+        ),
     )
-
-    with st.expander("Planlama modeli", expanded=True):
-        planning_label = st.selectbox(
-            "Planlama yaklaşımı",
-            ["Tam optimizasyon", "Mevcut planı koruyarak güncelle"],
-            help=(
-                "Tam optimizasyon bütün planı yeniden kurar. Mevcut planı koruma modu "
-                "önce yeni çalışanı mevcut durağa ekler ve yalnızca gerekirse yeni durak/rota açar."
-            ),
+    mode_label = st.radio(
+        "Rota sayısı",
+        ["Sabit 3 servis", "Otomatik (kapasite + süreye göre)"],
+        index=1,
+    )
+    stop_policy_label = st.radio(
+        "Durak adayı politikası",
+        [
+            "Yüklenen durakları kullan; gerekirse yeni aday öner",
+            "Yalnızca yüklenen durakları kullan",
+        ],
+        help=(
+            "Yeni aday seçeneği çalışan evleri ve yakın evlerin orta noktalarını da değerlendirir. "
+            "Bu noktalar saha onayı olmadan kesin durak değildir."
+        ),
+    )
+    capacity = st.number_input("Araç kapasitesi", min_value=1, max_value=100, value=40, step=1)
+    max_walk_m = st.slider(
+        "Azami yürüme mesafesi (metre)",
+        min_value=200,
+        max_value=1200,
+        value=500,
+        step=50,
+        help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
+    )
+    target_average_walk_m = st.slider(
+        "Hedef ortalama yürüme (metre)",
+        min_value=100,
+        max_value=int(max_walk_m),
+        value=min(300, int(max_walk_m)),
+        step=25,
+        help="Minimum durak çözümüne, ortalama yürüyüş bu hedefe inene kadar durak eklenir.",
+    )
+    max_route_minutes = st.slider(
+        "Azami rota süresi (dakika)",
+        min_value=60,
+        max_value=180,
+        value=120,
+        step=5,
+        help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
+    )
+    wait_seconds_per_stop = st.number_input(
+        "Durak başına bekleme (saniye)",
+        min_value=0,
+        max_value=180,
+        value=45,
+        step=15,
+    )
+    direction_label = st.radio(
+        "Sefer yönü",
+        ["Sabah (08.00 varış): çalışan → fabrika", "Akşam (17.30 çıkış): fabrika → çalışan"],
+    )
+    use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
+    road_consent = False
+    if use_road_network:
+        road_consent = st.checkbox(
+            "Koordinatların yol hesabı için açık OSRM servisine gönderilmesini onaylıyorum. "
+            "İsim, sicil ve adres gönderilmez."
         )
-        mode_label = "Otomatik optimizasyon"
-        st.caption(
-            "Araç sayısı sabitlenmez. Sistem kapasite, doluluk, yürüme ve toplam servis süresini birlikte değerlendirerek gerekli araç sayısını seçer."
-        )
-        stop_policy_label = st.selectbox(
-            "Durak politikası",
-            [
-                "Yüklenen durakları kullan; gerekirse yeni aday öner",
-                "Yalnızca yüklenen durakları kullan",
-            ],
-            help=(
-                "Yüklenen duraklar önceliklidir. Uygun değilse sistem 1000 m sınırı içinde "
-                "yeni güzergâh adayları üretir; çalışan adresi doğrudan durak olarak kullanılmaz."
-            ),
-        )
-
-    with st.expander("Kapasite ve süre kısıtları", expanded=True):
-        capacity = st.number_input(
-            "Araç kapasitesi",
-            min_value=1,
-            max_value=100,
-            value=45,
-            step=1,
-        )
-        max_walk_m = st.slider(
-            "Azami yürüme mesafesi",
-            min_value=200,
-            max_value=1200,
-            value=1000,
-            step=50,
-            format="%d m",
-            help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
-        )
-        target_average_walk_m = min(FIXED_TARGET_AVERAGE_WALK_M, int(max_walk_m))
-        max_route_minutes = 0
-        st.caption(
-            "Rota süresi için yapay bir 50/60/120 dk sınırı uygulanmaz. Optimizasyon mevcut servis toplam süresini azaltmayı hedefler."
-        )
-        wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
-
-    with st.expander("Sefer ve yol hesabı", expanded=True):
-        direction_label = st.selectbox(
-            "Sefer yönü",
-            [
-                "Sabah (08.00 varış): çalışan → fabrika",
-                "Akşam (17.30 çıkış): fabrika → çalışan",
-            ],
-        )
-        use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
-        road_consent = False
-        if use_road_network:
-            road_consent = st.checkbox(
-                "Koordinatların yol hesabı için paylaşılmasını onaylıyorum",
-                help=(
-                    "Yalnızca koordinatlar açık OSRM servisine gönderilir. "
-                    "İsim, sicil ve açık adres paylaşılmaz."
-                ),
-            )
-
-    st.markdown(
-        """
-        <div class="sidebar-note">
-            <strong>Çalışma düzeni</strong><br>
-            Mesai 08.00–17.30 · Durak bekleme süresi 45 sn ·
-            Yakın çalışanlar ortak buluşma noktasında eşleştirilir.
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.caption(
+        "Mesai: 08.00–17.30 · Yakın çalışanlar ortak durakta buluşur · "
+        "Sürüş ve durak beklemeleri birlikte sınırlandırılır."
     )
 
 allow_automatic_candidates = not stop_policy_label.startswith("Yalnızca")
-section_header(
-    "01",
-    "Veri yükleme",
-    "Güncel çalışan listesini ve varsa onaylı durak listenizi sisteme ekleyin.",
+uploaded = st.file_uploader("Koordinatlı çalışan Excel'ini yükleyin", type=["xlsx", "xls"])
+approved_stop_file = st.file_uploader(
+    "Mevcut / aday durak Excel'i (önerilir)",
+    type=["xlsx", "xls"],
+    help=(
+        "Durak_Adi, Enlem ve Boylam sütunlarını içeren dosyadır. Saha_Onayi sütununda "
+        "Uygun Değil/Reddedildi olan satırlar kullanılmaz; Bekliyor olanlar yalnızca adaydır."
+    ),
 )
-upload_left, upload_right = st.columns(2, gap="large")
-with upload_left:
-    uploaded = st.file_uploader(
-        "Çalışan listesi",
-        type=["xlsx", "xls"],
-        help="Dosyada çalışanların enlem ve boylam bilgilerinin bulunması gerekir.",
-    )
-with upload_right:
-    approved_stop_file = st.file_uploader(
-        "Mevcut / aday durak listesi",
-        type=["xlsx", "xls"],
-        help=(
-            "Durak_Adi, Enlem ve Boylam sütunlarını içeren dosyadır. Saha_Onayi sütununda "
-            "Uygun Değil/Reddedildi olan satırlar kullanılmaz; Bekliyor olanlar yalnızca adaydır."
-        ),
-    )
 previous_plan_file = None
 if planning_label.startswith("Mevcut"):
     previous_plan_file = st.file_uploader(
-        "Önceki rota sonuç dosyası",
+        "Önceki rota sonuç Excel'i",
         type=["xlsx"],
         help=(
             "Bir önceki çalıştırmada `Rota sonuçlarını Excel olarak indir` düğmesiyle "
@@ -901,7 +659,7 @@ if planning_label.startswith("Mevcut"):
         )
 
 if uploaded is None:
-    st.info("Başlamak için enlem ve boylam bilgileri dolu olan çalışan listenizi yükleyin.")
+    st.info("Başlamak için `Enlem` ve `Boylam` sütunları dolu olan Excel dosyanızı yükleyin.")
     st.stop()
 
 raw_bytes = uploaded.getvalue()
@@ -913,7 +671,6 @@ file_key = hashlib.sha256(
     + previous_bytes
     + planning_label.encode("utf-8")
     + stop_policy_label.encode("utf-8")
-    + APP_VERSION.encode("utf-8")
 ).hexdigest()
 if st.session_state.get("file_key") != file_key:
     try:
@@ -941,17 +698,12 @@ factory_mask = valid_people["Tip"].apply(is_factory)
 factory_rows = valid_people[factory_mask]
 employees = valid_people[~factory_mask].reset_index(drop=True)
 
-section_header(
-    "02",
-    "Veri kontrolü",
-    "Rota hesabına alınacak çalışanları, koordinat durumunu ve kapasite ihtiyacını doğrulayın.",
-)
-approved_count = len(st.session_state.get("approved_candidates", []))
-c1, c2, c3, c4 = st.columns(4)
+st.subheader("1. Veri kontrolü")
+c1, c2, c3 = st.columns(3)
 c1.metric("Aktif servis kullanıcısı", len(employees))
 c2.metric("Eksik çalışan koordinatı", int(employees[["Enlem", "Boylam"]].isna().any(axis=1).sum()))
-c3.metric("Kapasiteye göre minimum", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
-c4.metric("Kullanılabilir durak", approved_count)
+c3.metric("Minimum servis", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
+approved_count = len(st.session_state.get("approved_candidates", []))
 if approved_count:
     candidate_stats = st.session_state.get("approved_candidate_stats", {})
     st.caption(
@@ -965,10 +717,10 @@ if approved_count:
         )
     )
 
-with st.expander("Çalışan verisini görüntüle", expanded=False):
+with st.expander("Yüklenen veriyi göster", expanded=False):
     st.dataframe(working, width="stretch", hide_index=True)
 
-st.markdown("##### Fabrika bilgisi")
+st.markdown("#### Fabrika bilgisi")
 if not factory_rows.empty and factory_rows[["Enlem", "Boylam"]].notna().all(axis=1).any():
     factory = factory_rows[factory_rows[["Enlem", "Boylam"]].notna().all(axis=1)].iloc[0]
     factory_lat = float(factory["Enlem"])
@@ -1005,27 +757,22 @@ incremental_ready = not incremental_mode or (
 approved_ready = allow_automatic_candidates or bool(
     st.session_state.get("approved_candidates", [])
 )
-section_header(
-    "03",
-    "Rotaları oluştur",
-    "Seçilen ayarlara göre ortak durakları, araç dağılımını ve güzergâh sırasını hesaplayın.",
-)
+st.subheader("2. Rotaları oluştur")
 if use_road_network and not road_consent:
     st.info("Gerçek yol güzergâhı için sol menüdeki koordinat paylaşım onayını işaretleyin.")
 if incremental_mode and mapping["id"] is None:
     st.error("Mevcut planı korumak için çalışan Excel'inde benzersiz bir sicil/ID sütunu seçilmelidir.")
 if not approved_ready:
     st.error("Yalnızca yüklenen duraklar modunda mevcut/adayı durak Excel'i yüklenmelidir.")
-button_label = "Mevcut Planı Güncelle" if incremental_mode else "Rotaları Oluştur"
+button_label = "Mevcut planı güncelle" if incremental_mode else "Optimizasyonu çalıştır"
 if st.button(
     button_label,
     type="primary",
     disabled=not ready or not road_ready or not incremental_ready or not approved_ready,
-    use_container_width=True,
 ):
     with st.spinner("Ortak duraklar seçiliyor ve rotalar birlikte optimize ediliyor..."):
         try:
-            mode = "auto"
+            mode = "fixed" if mode_label.startswith("Sabit") else "auto"
             direction = "morning" if direction_label.startswith("Sabah") else "evening"
             common_arguments = {
                 "employees": employees,
@@ -1088,29 +835,15 @@ if shared_routes is None:
 optimized_vehicle_count = result["vehicle_count"]
 result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
 result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
-result_target_average_walk_m = st.session_state.get(
-    "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
-)
+result_target_average_walk_m = st.session_state.get("result_target_average_walk_m", 300)
 
-section_header(
-    "04",
-    "Optimizasyon sonucu",
-    "Önerilen servis planının temel performans göstergelerini ve güzergâh detaylarını inceleyin.",
-)
-for warning in result.get("warnings", []):
-    if "Yol ağı verisi kullanılamadı" in warning:
-        st.warning("Gerçek yol verisine ulaşılamadı; rota yaklaşık mesafeyle hesaplandı.")
-    elif "maksimum rota süresini aşıyor" in warning:
-        st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
+st.subheader("3. Optimizasyon sonucu")
+for warning in result["warnings"]:
+    st.warning(warning)
 
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
-automatic_stop_count = sum(
-    stop.get("source") in {"Otomatik ortak nokta", "Çalışan adresi"}
-    for route in nonempty_routes
-    for stop in route["stops"]
-)
 multi_stop_count = sum(
     stop["passenger_count"] > 1
     for route in nonempty_routes
@@ -1127,37 +860,28 @@ average_walk = sum(all_walks) / len(all_walks) if all_walks else 0
 maximum_walk = max(all_walks, default=0)
 total_distance = sum(route["distance_km"] for route in nonempty_routes)
 longest_route = max((route["total_minutes"] for route in nonempty_routes), default=0)
-r1, r2, r3, r4 = st.columns(4)
+r1, r2, r3, r4, r5, r6 = st.columns(6)
 r1.metric("Önerilen servis", optimized_vehicle_count)
 r2.metric("Toplam çalışan", len(employees))
-r3.metric("Toplam durak", total_stop_count)
-r4.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
-s1, s2, s3, s4 = st.columns(4)
-s1.metric("Ortalama yürüme", f"{average_walk:.0f} m")
-s2.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
-s3.metric("Toplam rota mesafesi", f"{total_distance:.1f} km")
-s4.metric("En uzun rota", f"{longest_route:.0f} dk")
-
-with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
-    t1, t2, t3, t4 = st.columns(4)
-    if result.get("planning_mode") == "incremental":
-        t1.metric("Eşleşmesi korunan", result.get("preserved_employee_count", 0))
-        t2.metric("Mevcut durağa eklenen", result.get("added_to_existing_count", 0))
-        t3.metric("Yeni durak", result.get("new_stop_count", 0))
-        t4.metric("Yeni rota", result.get("added_route_count", 0))
-    else:
-        t1.metric("Değerlendirilen aday durak", result.get("candidate_count", 0))
-        t2.metric(
-            "Kanıtlanmış minimum" if result.get("minimum_proven") else "Bulunan en iyi alt plan",
-            result.get("minimum_stop_count", 0),
-        )
-        t3.metric("Çoklu ortak durak", multi_stop_count)
-        t4.metric("Tekil durak", single_stop_count)
-if automatic_stop_count:
-    st.caption(
-        f"{automatic_stop_count} otomatik/adres tabanlı durak önerildi; "
-        "kesinleştirilmeden önce saha uygunluğu kontrol edilmelidir."
+if result.get("planning_mode") == "incremental":
+    r3.metric("Eşleşmesi korunan", result.get("preserved_employee_count", 0))
+    r4.metric("Mevcut durağa eklenen", result.get("added_to_existing_count", 0))
+    r5.metric("Yeni durak", result.get("new_stop_count", 0))
+else:
+    r3.metric("Aday durak", result["candidate_count"])
+    r4.metric(
+        "Kanıtlı minimum durak" if result["minimum_proven"] else "En iyi bulunan alt plan",
+        result["minimum_stop_count"],
     )
+    r5.metric("Seçilen durak", total_stop_count)
+r6.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
+s1, s2, s3, s4, s5, s6 = st.columns(6)
+s1.metric("Çoklu ortak durak", multi_stop_count)
+s2.metric("Tekil durak", single_stop_count)
+s3.metric("Ortalama yürüme", f"{average_walk:.0f} m")
+s4.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
+s5.metric("Toplam mesafe", f"{total_distance:.1f} km")
+s6.metric("En uzun rota", f"{longest_route:.0f} dk")
 if result.get("planning_mode") == "incremental":
     st.success(
         f"Mevcut plan korundu: {result.get('preserved_employee_count', 0)} çalışan eski durağında kaldı; "
@@ -1171,10 +895,13 @@ if result.get("planning_mode") == "incremental":
     )
 else:
     st.caption(
-        f"Hesaplama: {result_max_walk_m} m azami yürüyüş, "
-        f"{result_target_average_walk_m} m sabit konfor hedefi, "
-        f"durak başına {result_wait_seconds} sn bekleme ve "
-        "Rota süresi, mevcut saha süresini azaltma hedefiyle optimize edildi; yapay azami süre sınırı uygulanmadı."
+        "Yöntem: durak seçimi içeren okul/personel servisi rotalama (SBRP-BSS). "
+        f"Önce {result_max_walk_m} m azami yürüyüşle "
+        f"{'kanıtlı minimum' if result['minimum_proven'] else 'süre sınırında bulunan en iyi'} durak planı kuruldu; "
+        f"ardından ortalama yürüyüşü {result_target_average_walk_m} m hedefine yaklaştırmak için durak eklendi. "
+        "Tahmini yürüyüş, kuş uçuşu mesafeye %20 yol sapması eklenerek hesaplandı. "
+        f"Durak başına {result_wait_seconds} sn bekleme ve {result_max_route_minutes} dk toplam rota sınırı kullanıldı. "
+        "Sahada yaya geçidi, kaldırım ve güvenli bekleme alanı kontrolü yapılmalıdır."
     )
 
 palette = [
@@ -1257,33 +984,16 @@ deck = pdk.Deck(
     layers=layers,
     initial_view_state=view_state,
     map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-    tooltip={"text": "{label}"},
+    tooltip={"text": "{label}{route}"},
 )
-st.markdown("#### Rota haritası")
-st.caption("Rota çizgilerinin ve numaralı durakların ayrıntılarını görmek için harita üzerinde gezinin.")
 st.pydeck_chart(deck, width="stretch")
 
-st.markdown("#### Rota detayları")
 for route in nonempty_routes:
-    route_fill = route["occupancy"] / result_capacity if result_capacity else 0
     st.markdown(
-        f"""
-        <div class="route-card">
-            <div class="route-card-head">
-                <div class="route-title">Rota {route['vehicle_no']}</div>
-                <div class="route-occupancy">
-                    {route['occupancy']} / {result_capacity} yolcu · %{route_fill * 100:.0f} doluluk
-                </div>
-            </div>
-            <div class="route-stat-grid">
-                <div class="route-stat"><strong>{len(route['stops'])}</strong><span>Durak</span></div>
-                <div class="route-stat"><strong>{route['distance_km']:.1f} km</strong><span>Mesafe</span></div>
-                <div class="route-stat"><strong>{route['drive_minutes']:.0f} dk</strong><span>Sürüş</span></div>
-                <div class="route-stat"><strong>{route['total_minutes']:.0f} dk</strong><span>Toplam süre</span></div>
-                <div class="route-stat"><strong>{route['average_walk_m']:.0f} m</strong><span>Ort. yürüme</span></div>
-            </div>
-        </div>
-        """,
+        f"""<div class="route-card"><b>Rota {route['vehicle_no']}</b> · {route['occupancy']}/{result_capacity} yolcu ·
+        {len(route['stops'])} durak · {route['distance_km']:.1f} km · {route['drive_minutes']:.0f} dk sürüş ·
+        {route['total_minutes']:.0f} dk toplam ·
+        ort. {route['average_walk_m']:.0f} m yürüme</div>""",
         unsafe_allow_html=True,
     )
     stop_rows = []
@@ -1327,18 +1037,14 @@ for route in nonempty_routes:
                 "Bu Durağa Gelecekler": "-",
             }
         )
-    with st.expander(f"Rota {route['vehicle_no']} · Durak ve yolcu listesini görüntüle"):
+    with st.expander(f"Rota {route['vehicle_no']} duraklarını ve yolcularını göster"):
         st.dataframe(pd.DataFrame(stop_rows), width="stretch", hide_index=True)
 
 export_bytes = result_workbook(shared_routes, employees, result_capacity)
 st.session_state["last_plan_bytes"] = export_bytes
-st.markdown("#### Raporlama")
-st.caption("Rota özetini, durak sıralamasını ve çalışan–durak eşleşmelerini tek Excel dosyasında indirin.")
 st.download_button(
-    "Rota Sonuçlarını Excel Olarak İndir",
+    "📥 Rota sonuçlarını Excel olarak indir",
     data=export_bytes,
     file_name="servis_rota_sonuclari.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    type="primary",
-    use_container_width=True,
 )

@@ -316,13 +316,41 @@ def optimize_candidate_stops(
         ]
         for employee_index in range(len(employee_coordinates))
     ]
-    for employee_index, covering in enumerate(cover_by_employee):
-        if not covering:
-            raise ValueError(f"{employee_index + 1}. çalışan için erişilebilir aday durak bulunamadı.")
+
+    uncovered_employee_indices = [
+        employee_index
+        for employee_index, covering in enumerate(cover_by_employee)
+        if not covering
+    ]
+    if uncovered_employee_indices:
+        displayed = ", ".join(
+            str(employee_index + 1)
+            for employee_index in uncovered_employee_indices[:20]
+        )
+        remainder = len(uncovered_employee_indices) - 20
+        suffix = f" ve {remainder} kişi daha" if remainder > 0 else ""
+        raise ValueError(
+            f"{len(uncovered_employee_indices)} çalışan için erişilebilir aday durak bulunamadı. "
+            f"Çalışan sıraları: {displayed}{suffix}."
+        )
+
+    # Yüklenen/mevcut bir durakla kapsanabilen çalışan, otomatik adaylara
+    # aktarılmaz. Otomatik ve adres tabanlı adaylar yalnızca yüklenen duraklarla
+    # hiç kapsanamayan çalışanlar için devreye girer. Böylece durak türü önceliği
+    # sadece aday ayıklamada değil, asıl optimizasyon modelinde de uygulanır.
+    uploaded_sources = {"Yüklenen aday durak", "Onaylı durak"}
+    eligible_by_employee: list[list[int]] = []
+    for covering in cover_by_employee:
+        uploaded_covering = [
+            candidate_index
+            for candidate_index in covering
+            if candidates[candidate_index].source in uploaded_sources
+        ]
+        eligible_by_employee.append(uploaded_covering or covering)
 
     model = cp_model.CpModel()
     selected_vars = [model.new_bool_var(f"candidate_{index}") for index in range(len(candidates))]
-    for covering in cover_by_employee:
+    for covering in eligible_by_employee:
         model.add(sum(selected_vars[index] for index in covering) >= 1)
     model.minimize(sum(selected_vars))
 
@@ -341,7 +369,7 @@ def optimize_candidate_stops(
     def walking_assignment(selected_indices: set[int]) -> tuple[list[int], list[float]]:
         assigned: list[int] = []
         walks: list[float] = []
-        for employee_index, covering in enumerate(cover_by_employee):
+        for employee_index, covering in enumerate(eligible_by_employee):
             feasible = [index for index in covering if index in selected_indices]
             chosen = min(feasible, key=lambda index: (distances_m[index][employee_index], index))
             assigned.append(chosen)
@@ -359,7 +387,7 @@ def optimize_candidate_stops(
             improvement = sum(
                 max(0.0, walks[employee_index] - distances_m[candidate_index][employee_index])
                 for employee_index in range(len(employee_coordinates))
-                if distances_m[candidate_index][employee_index] <= max_walk_m + 1e-9
+                if candidate_index in eligible_by_employee[employee_index]
             )
             if improvement > best_improvement + 1e-9:
                 best_candidate = candidate_index

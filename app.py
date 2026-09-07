@@ -12,6 +12,7 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    assign_common_stops_to_routes_partial,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -20,9 +21,16 @@ from core import (
 )
 
 
-APP_VERSION = "2026.08.24-professional-ui-v2"
+APP_VERSION = "2026.09.07-duration-optimized"
 FIXED_TARGET_AVERAGE_WALK_M = 400
-FIXED_WAIT_SECONDS_PER_STOP = 45
+FIXED_WAIT_SECONDS_PER_STOP = 0
+
+# Mevcut saha rotaları: sistem önce bu değerlerin altında çözüm arar.
+CURRENT_ROUTE_BENCHMARKS = {
+    "morning": [50.0, 50.0, 57.0],
+    "evening": [80.0, 65.0, 62.0],
+}
+MAX_SERVICE_COUNT = 4
 
 
 st.set_page_config(
@@ -598,6 +606,54 @@ def materialize_shared_routes(
     return shared_routes
 
 
+def _route_duration_stats(shared_routes: list[dict]) -> tuple[float, float]:
+    durations = [float(route["total_minutes"]) for route in shared_routes if route.get("occupancy", 0)]
+    return sum(durations), max(durations, default=0.0)
+
+
+def _beats_current_benchmark(shared_routes: list[dict], direction: str) -> bool:
+    """3 servis çözümünün mevcut saha planından gerçekten daha iyi olup olmadığını kontrol eder."""
+    durations = sorted(
+        [float(route["total_minutes"]) for route in shared_routes if route.get("occupancy", 0)]
+    )
+    benchmark = sorted(CURRENT_ROUTE_BENCHMARKS[direction])
+    if len(durations) != len(benchmark):
+        return False
+    old_total = sum(benchmark)
+    new_total = sum(durations)
+    old_longest = max(benchmark)
+    new_longest = max(durations, default=0.0)
+    return new_total < old_total - 0.1 and new_longest <= old_longest + 0.1
+
+
+def _beats_current_benchmark_with_four(shared_routes: list[dict], direction: str) -> bool:
+    """4 servis kullanıldığında toplam süre ve en uzun rota da mevcut plandan iyi olmalıdır."""
+    new_total, new_longest = _route_duration_stats(shared_routes)
+    benchmark = CURRENT_ROUTE_BENCHMARKS[direction]
+    return new_total < sum(benchmark) - 0.1 and new_longest <= max(benchmark) + 0.1
+
+
+def _materialize_with_meta(
+    allocated_routes,
+    duration_matrix,
+    distance_matrix,
+    direction,
+    wait_seconds_per_stop,
+    service_label=None,
+):
+    shared_routes = materialize_shared_routes(
+        allocated_routes,
+        duration_matrix,
+        distance_matrix,
+        direction,
+        wait_seconds_per_stop,
+    )
+    if service_label:
+        for route in shared_routes:
+            route["service_label"] = service_label
+    return shared_routes
+
+
 def build_shared_routes(
     employees: pd.DataFrame,
     factory_coordinates: tuple[float, float],
@@ -612,7 +668,7 @@ def build_shared_routes(
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
 ):
-    """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
+    """Önce 3 servisi mevcut sürelerin altına indirir; gerekirse en fazla 4 servis açar."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
     candidates = generate_candidate_stops(
         employee_coordinates,
@@ -639,65 +695,138 @@ def build_shared_routes(
         use_road_network=use_road_network,
     )
 
-    minimum_vehicle_count = math.ceil(len(employees) / capacity)
-    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
-    if vehicle_count < minimum_vehicle_count:
+    # Bekleme süresi iş kuralı olarak 0: süre karşılaştırması gerçek sürüş süresine dayanır.
+    wait_seconds_per_stop = 0
+    benchmark = CURRENT_ROUTE_BENCHMARKS[direction]
+
+    def finish(allocated_routes, vehicle_count, planning_mode, extra_count=0, dropped_stops=None):
+        shared_routes = materialize_shared_routes(
+            allocated_routes,
+            duration_matrix,
+            distance_matrix,
+            direction,
+            wait_seconds_per_stop,
+        )
+        if extra_count:
+            shared_routes[-1]["service_label"] = f"Ek Servis ({extra_count} kişi)"
+            shared_routes[-1]["is_extra_service"] = True
+        for route in shared_routes:
+            route.setdefault("is_extra_service", False)
+        total_minutes, longest_minutes = _route_duration_stats(shared_routes)
+        meta = {
+            "vehicle_count": vehicle_count,
+            "candidate_count": len(candidates),
+            "minimum_stop_count": minimum_stop_count,
+            "minimum_proven": minimum_proven,
+            "selected_stop_count": len(all_stops),
+            "matrix_source": matrix_source,
+            "warnings": warnings,
+            "planning_mode": planning_mode,
+            "current_total_minutes": sum(benchmark),
+            "optimized_total_minutes": total_minutes,
+            "current_longest_minutes": max(benchmark),
+            "optimized_longest_minutes": longest_minutes,
+            "duration_improvement_minutes": sum(benchmark) - total_minutes,
+            "extra_service_passenger_count": int(extra_count),
+            "dropped_stop_count": len(dropped_stops or []),
+        }
+        return shared_routes, meta
+
+    # 1) Önce mevcut algoritmanın aynısını 3 araçla, sadece daha iyi süre hedefiyle çalıştır.
+    try:
+        allocated_3 = assign_common_stops_to_routes(
+            all_stops,
+            route_coordinates,
+            vehicle_count=3,
+            capacity=capacity,
+            duration_matrix=duration_matrix,
+            direction=direction,
+            wait_seconds_per_stop=0,
+            max_route_minutes=max_route_minutes,
+            time_limit_seconds=20,
+        )
+        candidate_3 = materialize_shared_routes(
+            allocated_3, duration_matrix, distance_matrix, direction, 0
+        )
+        if _beats_current_benchmark(candidate_3, direction):
+            return finish(allocated_3, 3, "duration_optimized_3")
+    except ValueError:
+        allocated_3 = None
+
+    # 2) 3 servis mevcut planı iyileştiremiyorsa, en fazla 4 tam servisle dene.
+    # Bu aşama yine aynı OR-Tools motorunu kullanır; yeni bir 5/6/7. servis üretmez.
+    try:
+        allocated_4 = assign_common_stops_to_routes(
+            all_stops,
+            route_coordinates,
+            vehicle_count=4,
+            capacity=capacity,
+            duration_matrix=duration_matrix,
+            direction=direction,
+            wait_seconds_per_stop=0,
+            max_route_minutes=max_route_minutes,
+            time_limit_seconds=25,
+        )
+        candidate_4 = materialize_shared_routes(
+            allocated_4, duration_matrix, distance_matrix, direction, 0
+        )
+        if _beats_current_benchmark_with_four(candidate_4, direction):
+            return finish(allocated_4, 4, "duration_optimized_4")
+    except ValueError:
+        allocated_4 = None
+
+    # 3) 4 tam servis de iyileştirme sağlayamıyorsa, 3 ana servise mümkün olan
+    # maksimum yolcuyu yerleştir ve yalnızca açıkta kalanları tek ek servise ayır.
+    try:
+        allocated_main, dropped_stops = assign_common_stops_to_routes_partial(
+            all_stops,
+            route_coordinates,
+            vehicle_count=3,
+            capacity=capacity,
+            duration_matrix=duration_matrix,
+            direction=direction,
+            wait_seconds_per_stop=0,
+            max_route_minutes=max_route_minutes,
+            time_limit_seconds=20,
+        )
+    except ValueError as exc:
         raise ValueError(
-            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
+            "3 servisle mevcut rota sürelerinin altına inilemedi ve en fazla 4 servisle "
+            "de iyileştirilebilir bir çözüm bulunamadı. Durak sayısı/yürüme sınırı veya "
+            "yol ağı verisi kontrol edilmelidir."
+        ) from exc
+
+    extra_count = sum(stop.passenger_count for stop in dropped_stops)
+    if extra_count <= 0:
+        raise ValueError(
+            "3 ve 4 servis çözümleri mevcut rota sürelerinden daha iyi sonuç vermedi. "
+            "Sistem daha uzun bir rotayı otomatik olarak kabul etmez."
         )
 
-    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
-    # sağlanmıyorsa araç sayısı birer artırılır.
-    last_error: Exception | None = None
-    maximum_vehicle_count = max(
-        vehicle_count,
-        min(len(all_stops), minimum_vehicle_count + 5),
+    # Açıkta kalan durakları tek ve küçük bir ek servis olarak çöz.
+    extra_capacity = max(capacity, extra_count)
+    extra_routes = assign_common_stops_to_routes(
+        dropped_stops,
+        route_coordinates,
+        vehicle_count=1,
+        capacity=extra_capacity,
+        duration_matrix=duration_matrix,
+        direction=direction,
+        wait_seconds_per_stop=0,
+        max_route_minutes=0,
+        time_limit_seconds=15,
     )
-    while vehicle_count <= maximum_vehicle_count:
-        try:
-            allocated_routes = assign_common_stops_to_routes(
-                all_stops,
-                route_coordinates,
-                vehicle_count,
-                capacity,
-                duration_matrix,
-                direction,
-                wait_seconds_per_stop=wait_seconds_per_stop,
-                max_route_minutes=max_route_minutes,
-            )
-            break
-        except ValueError as exc:
-            last_error = exc
-            if mode == "fixed":
-                raise
-            vehicle_count += 1
-    else:
-        raise ValueError(
-            "Kapasite ve rota süresi sınırlarını birlikte sağlayan çözüm bulunamadı. "
-            "Azami rota süresini artırın veya kapasiteyi kontrol edin."
-        ) from last_error
-
-    shared_routes = materialize_shared_routes(
-        allocated_routes,
-        duration_matrix,
-        distance_matrix,
-        direction,
-        wait_seconds_per_stop,
+    combined_routes = allocated_main + extra_routes
+    shared_routes, meta = finish(
+        combined_routes,
+        4,
+        "duration_optimized_3_plus_extra",
+        extra_count=extra_count,
+        dropped_stops=dropped_stops,
     )
-    if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
-        warnings.append(
-            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
-        )
-    meta = {
-        "vehicle_count": vehicle_count,
-        "candidate_count": len(candidates),
-        "minimum_stop_count": minimum_stop_count,
-        "minimum_proven": minimum_proven,
-        "selected_stop_count": len(all_stops),
-        "matrix_source": matrix_source,
-        "warnings": warnings,
-        "planning_mode": "full",
-    }
+    meta["warnings"].append(
+        f"3 ana servis ile {extra_count} çalışan kapsanamadı; yalnızca bu çalışanlar için 1 ek servis oluşturuldu."
+    )
     return shared_routes, meta
 
 
@@ -843,7 +972,8 @@ with st.sidebar:
         )
         mode_label = st.selectbox(
             "Rota sayısı",
-            ["Otomatik (kapasite + süreye göre)", "Sabit 3 servis"],
+            ["Akıllı optimizasyon (önce 3, gerekirse 4 servis)", "Sabit 3 servis"],
+            help="Sistem önce 3 servisin toplam ve en uzun rota süresini mevcut planın altına indirmeyi dener. Başarılı olmazsa en fazla 4 servis kullanır.",
         )
         stop_policy_label = st.selectbox(
             "Durak politikası",
@@ -862,14 +992,14 @@ with st.sidebar:
             "Araç kapasitesi",
             min_value=1,
             max_value=100,
-            value=40,
+            value=45,
             step=1,
         )
         max_walk_m = st.slider(
             "Azami yürüme mesafesi",
             min_value=200,
             max_value=1200,
-            value=500,
+            value=1000,
             step=50,
             format="%d m",
             help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
@@ -882,7 +1012,7 @@ with st.sidebar:
             value=120,
             step=5,
             format="%d dk",
-            help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
+            help="Ana servisler için güvenlik üst sınırıdır. Optimizasyonun asıl hedefi mevcut servis sürelerinin altında kalmaktır.",
         )
         wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
 
@@ -909,7 +1039,7 @@ with st.sidebar:
         """
         <div class="sidebar-note">
             <strong>Çalışma düzeni</strong><br>
-            Mesai 08.00–17.30 · Durak bekleme süresi 45 sn ·
+            Mesai 08.00–17.30 · Durak bekleme süresi 0 sn ·
             Yakın çalışanlar ortak buluşma noktasında eşleştirilir.
         </div>
         """,

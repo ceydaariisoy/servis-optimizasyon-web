@@ -626,13 +626,6 @@ def _beats_current_benchmark(shared_routes: list[dict], direction: str) -> bool:
     return new_total < old_total - 0.1 and new_longest <= old_longest + 0.1
 
 
-def _beats_current_benchmark_with_four(shared_routes: list[dict], direction: str) -> bool:
-    """4 servis kullanıldığında toplam süre ve en uzun rota da mevcut plandan iyi olmalıdır."""
-    new_total, new_longest = _route_duration_stats(shared_routes)
-    benchmark = CURRENT_ROUTE_BENCHMARKS[direction]
-    return new_total < sum(benchmark) - 0.1 and new_longest <= max(benchmark) + 0.1
-
-
 def _materialize_with_meta(
     allocated_routes,
     duration_matrix,
@@ -766,7 +759,10 @@ def build_shared_routes(
             wait_seconds_per_stop=0,
             max_route_minutes=max_route_minutes,
             time_limit_seconds=25,
+            require_all_vehicles_used=True,
         )
+        if len([route for route in allocated_4 if route]) != 4:
+            raise ValueError("4 servis çözümünde 4 aktif rota oluşmadı.")
         candidate_4 = materialize_shared_routes(
             allocated_4, duration_matrix, distance_matrix, direction, 0
         )

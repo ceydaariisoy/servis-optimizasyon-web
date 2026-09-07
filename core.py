@@ -1328,6 +1328,7 @@ def assign_common_stops_to_routes(
     wait_seconds_per_stop: int = 45,
     max_route_minutes: float = 0,
     time_limit_seconds: int = 10,
+    require_all_vehicles_used: bool = False,
 ) -> list[list[CommonStop]]:
     """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
@@ -1403,6 +1404,15 @@ def assign_common_stops_to_routes(
     time_dimension = routing.GetDimensionOrDie("Time")
     # Toplam süre yanında en uzun rotayı da kısaltarak araçlar arasında denge kurar.
     time_dimension.SetGlobalSpanCostCoefficient(3)
+
+    # 4 servis seçildiğinde her aracın en az bir durak almasını zorunlu tut.
+    # Varsayılan False olduğu için 3 servis ve diğer mevcut kullanımlar değişmez.
+    if require_all_vehicles_used:
+        solver = routing.solver()
+        for vehicle_no in range(vehicle_count):
+            solver.Add(
+                routing.NextVar(routing.Start(vehicle_no)) != routing.End(vehicle_no)
+            )
 
     parameters = pywrapcp.DefaultRoutingSearchParameters()
     parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION

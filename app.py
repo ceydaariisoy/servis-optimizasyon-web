@@ -745,11 +745,14 @@ def build_shared_routes(
             # 4. rota artık 45 kişilik yeni bir ana servis olarak değil,
             # yalnızca 3 ana servisin kapasite/süre dışında bıraktığı çalışanlar
             # için "Ek Servis" olarak değerlendirilir. Minimum doluluk şartı yoktur.
-            limit4 = max(limits3)
+            # Ek servis ana servislerle aynı 57 dk sınırına zorlanmaz.
+            # Çünkü bu servis küçük/minibüs tipinde ayrı bir satın alma seçeneğidir.
+            # Ana 3 servis yine kendi gerçek süre benchmarklarına tabidir.
+            limit4 = max(float(max_route_minutes or 120), max(limits3))
             allocated_routes = assign_common_stops_to_routes(
                 all_stops, route_coordinates, 4, capacity, duration_matrix, direction,
                 wait_seconds_per_stop=0, max_route_minutes=limit4,
-                route_time_limits=[*limits3, limit4], time_limit_seconds=60,
+                route_time_limits=[*limits3, limit4], time_limit_seconds=90,
             )
             vehicle_count = 4
         except ValueError as exc:
@@ -757,8 +760,8 @@ def build_shared_routes(
 
     if allocated_routes is None:
         raise ValueError(
-            "3 servis mevcut toplam süre sınırları içinde çözülemedi; 4. servis de "
-            "en az 25 kişi şartıyla uygulanabilir bir çözüm üretemedi. "
+            "3 ana servis mevcut toplam süre sınırları içinde çözülemedi; "
+            "ek servis için de uygulanabilir bir rota üretilemedi. "
             f"Teknik neden: {last_error}"
         ) from last_error
 

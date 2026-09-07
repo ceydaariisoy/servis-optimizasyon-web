@@ -792,7 +792,7 @@ def build_shared_routes(
             wait_seconds_per_stop=0,
             max_route_minutes=MORNING_MAX_MINUTES,
             time_limit_seconds=30 if vehicle_count == 3 else 40,
-            require_all_vehicles_used=True,
+            require_all_vehicles_used=False,
         )
 
     def validate_paired_solution(morning_routes):
@@ -815,6 +815,11 @@ def build_shared_routes(
     for vehicle_count in (3, 4):
         try:
             morning_routes = try_morning(vehicle_count)
+            # OR-Tools 4 araç tanımlı olsa bile bazı araçları boş bırakabilir.
+            # 4 servis kararı yalnızca gerçekten 4 aktif rota varsa kabul edilir.
+            active_route_count = sum(1 for route in morning_routes if route)
+            if vehicle_count == 4 and active_route_count < 4:
+                continue
             paired = validate_paired_solution(morning_routes)
             if paired is not None:
                 evening_routes, morning_shared, evening_shared = paired
@@ -890,7 +895,7 @@ def build_shared_routes(
         wait_seconds_per_stop=0,
         max_route_minutes=MORNING_MAX_MINUTES,
         time_limit_seconds=20,
-        require_all_vehicles_used=True,
+        require_all_vehicles_used=False,
     )
     extra_routes_evening = reverse_for_return(extra_routes_morning)
     extra_morning_shared = route_durations(extra_routes_morning, "morning")

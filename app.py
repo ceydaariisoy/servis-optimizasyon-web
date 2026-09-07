@@ -685,6 +685,7 @@ def build_shared_routes(
                     math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY) if vehicle_count > 3 else 0
                 ),
                 route_time_limits=route_time_limits,
+                time_limit_seconds=30,
             )
             break
         except ValueError as exc:

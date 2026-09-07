@@ -1139,7 +1139,7 @@ def assign_common_stops_to_routes(
     direction: str = "morning",
     wait_seconds_per_stop: int = 45,
     max_route_minutes: float = 0,
-    time_limit_seconds: int = 10,
+    time_limit_seconds: int = 30,
     min_route_occupancy: int = 0,
     route_time_limits: Sequence[float] | None = None,
     new_route_min_occupancy: int = 0,
@@ -1221,18 +1221,27 @@ def assign_common_stops_to_routes(
             capacity_dimension.CumulVar(routing.End(vehicle)).SetRange(
                 min_route_occupancy, capacity
             )
+    # Kullanılacak araçların tamamı aktif olsun. 4 araçlı senaryoda "yeni servis"
+    # sabit olarak son araç değildir; araçlar matematiksel olarak simetrik olduğu için
+    # çözücüye herhangi bir aracı yeni servis olarak seçme özgürlüğü veriyoruz.
+    for vehicle in range(vehicle_count):
+        routing.ActiveVehicleVar(vehicle).SetValue(1)
+
     if new_route_min_occupancy > 0:
         if new_route_min_occupancy > capacity:
             raise ValueError("Yeni rota minimum doluluğu araç kapasitesini aşamaz.")
-        # 4+ araçlı çözümde yalnızca son araç yeni servis olarak değerlendirilir.
-        new_vehicle = vehicle_count - 1
-        capacity_dimension.CumulVar(routing.End(new_vehicle)).SetRange(
-            new_route_min_occupancy, capacity
-        )
-        # Araçların simetrik olmasından dolayı yeni servis kuralının boşa çıkmaması için
-        # yeni araç en az bir durak ziyaret etmek zorundadır. Doluluk alt sınırı zaten
-        # 25 kişi olduğundan bu kısıt sadece çözücünün gereksiz boş araç kullanmasını önler.
-        routing.ActiveVehicleVar(new_vehicle).SetValue(1)
+        # 4. servis kuralını belirli bir araç numarasına bağlamak yerine,
+        # 4 rotadan EN AZ BİRİNİN 25+ kişi olmasını zorunlu kılıyoruz.
+        # Böylece OR-Tools rota numarası ile gerçek servis numarasını karıştırmıyor.
+        solver = routing.solver()
+        new_route_flags = []
+        for vehicle in range(vehicle_count):
+            flag = solver.BoolVar(f"new_route_ok_{vehicle}")
+            end_load = capacity_dimension.CumulVar(routing.End(vehicle))
+            solver.Add(end_load >= new_route_min_occupancy).OnlyEnforceIf(flag)
+            solver.Add(end_load <= new_route_min_occupancy - 1).OnlyEnforceIf(flag.Not())
+            new_route_flags.append(flag)
+        solver.Add(sum(new_route_flags) >= 1)
 
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
     routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")

@@ -56,6 +56,10 @@ DEFAULT_EXTRA_ROUTE_LIMIT = {
     "evening": 80.0,
 }
 
+# Yeni servis ancak araç kapasitesinin en az bu oranına ulaşabiliyorsa
+# açılır. 0.55 = %55 doluluk. Bu değer %50-%60 aralığının ortasıdır.
+MIN_NEW_ROUTE_OCCUPANCY = 0.55
+
 
 def get_route_time_limits(
     direction: str,
@@ -696,6 +700,7 @@ def update_routes_incrementally(
     mode: str = "auto",
     use_road_network: bool = True,
     allow_automatic_candidates: bool = True,
+    min_new_route_occupancy: float = MIN_NEW_ROUTE_OCCUPANCY,
 ) -> tuple[list[list[CommonStop]], list[list[float]], list[list[float]], dict]:
     """Mevcut durak ve rota yapısını koruyarak yeni çalışanları plana ekler.
 
@@ -711,6 +716,8 @@ def update_routes_incrementally(
         raise ValueError("Rota modu 'fixed' veya 'auto' olmalıdır.")
     if capacity <= 0:
         raise ValueError("Araç kapasitesi sıfırdan büyük olmalıdır.")
+    if not 0 < min_new_route_occupancy <= 1:
+        raise ValueError("min_new_route_occupancy 0 ile 1 arasında olmalıdır.")
     if not employee_coordinates:
         return [], [[0.0]], [[0.0]], {
             "vehicle_count": 0,
@@ -774,6 +781,9 @@ def update_routes_incrementally(
         index for index in range(len(employee_coordinates)) if index not in assigned_employees
     ]
     route_loads = [sum(stop.passenger_count for stop in route) for route in routes]
+    max_route_count = max_route_count_by_occupancy(
+        len(employee_coordinates), capacity, min_new_route_occupancy
+    )
 
     # Yeni/adresi değişmiş çalışan için ilk tercih mevcut rota üzerindeki bir
     # duraktır. Böylece durak sırası ve yol kilometresi değişmez.
@@ -923,10 +933,63 @@ def update_routes_incrementally(
                     raise ValueError(
                         f"Yeni durak tek başına {max_route_minutes:.0f} dakikalık rota sınırını aşıyor."
                     )
-                routes.append([])
-                route_loads.append(0)
-                added_route_count += 1
-                continue
+                # Yeni servis yalnızca yeterli doluluğa ulaşabilecekse açılır.
+                # Aksi halde mevcut filoyu parçalamamak için en az ek süreli
+                # mevcut rotaya yerleştirmeyi deniyoruz ve kullanıcıyı uyarıyoruz.
+                remaining_passengers = len(pending_pairs)
+                projected_new_load = min(remaining_passengers, capacity)
+                required_new_load = math.ceil(
+                    capacity * min_new_route_occupancy
+                )
+                if (
+                    len(routes) < max_route_count
+                    and projected_new_load >= required_new_load
+                ):
+                    routes.append([])
+                    route_loads.append(0)
+                    added_route_count += 1
+                    continue
+
+                if routes:
+                    # Yeni servis açmak yerine mevcut rotalardan en az yüklü
+                    # olana ekle. Bu durumda süre benchmarkı aşılabilir; amaç
+                    # gereksiz düşük doluluklu yeni servis oluşturmamaktır.
+                    fallback_route = min(
+                        range(len(routes)),
+                        key=lambda index: (route_loads[index], index),
+                    )
+                    available = capacity - route_loads[fallback_route]
+                    if available <= 0:
+                        raise ValueError(
+                            "Mevcut servisler dolu ve yeni servis için %"
+                            f"{min_new_route_occupancy * 100:.0f} doluluk eşiği sağlanamıyor."
+                        )
+                    take = min(available, len(pending_pairs))
+                    selected_pairs = pending_pairs[:take]
+                    pending_pairs = pending_pairs[take:]
+                    fragment = CommonStop(
+                        anchor_index=new_stop.anchor_index,
+                        member_indices=[pair[0] for pair in selected_pairs],
+                        walking_distances_m=[pair[1] for pair in selected_pairs],
+                        latitude=new_stop.latitude,
+                        longitude=new_stop.longitude,
+                        label=new_stop.label,
+                        source=new_stop.source,
+                        matrix_index=new_stop.matrix_index,
+                    )
+                    routes[fallback_route].append(fragment)
+                    route_loads[fallback_route] += take
+                    warnings.append(
+                        f"Yeni servis açılmadı: yeni rotanın doluluğu %"
+                        f"{(projected_new_load / capacity) * 100:.0f} ile minimum %"
+                        f"{min_new_route_occupancy * 100:.0f} eşiğinin altında kalacaktı. "
+                        f"Çalışanlar mevcut Servis {fallback_route + 1}'e dağıtıldı."
+                    )
+                    continue
+
+                raise ValueError(
+                    "Çalışanlar için servis oluşturulamadı."
+                )
 
             take, _, _, route_index, placement_code = min(
                 placements,
@@ -1575,6 +1638,29 @@ def _angular_clusters(
     return best_clusters or [[] for _ in range(vehicle_count)]
 
 
+def max_route_count_by_occupancy(
+    employee_count: int,
+    capacity: int,
+    min_occupancy: float = MIN_NEW_ROUTE_OCCUPANCY,
+) -> int:
+    """Toplam çalışan sayısına göre açılabilecek azami servis sayısını belirler.
+
+    Amaç, yeni bir servis açıldığında filonun gereksiz yere parçalanmasını
+    önlemektir. Örneğin 40 kişilik araçta %55 eşik, yeni servisin en az
+    22 yolcu taşımasını hedefler.
+    """
+    if employee_count <= 0 or capacity <= 0:
+        return 0
+    if not 0 < min_occupancy <= 1:
+        raise ValueError("min_occupancy 0 ile 1 arasında olmalıdır.")
+
+    minimum_vehicles = math.ceil(employee_count / capacity)
+    occupancy_limited = math.floor(
+        employee_count / (capacity * min_occupancy)
+    )
+    return max(minimum_vehicles, occupancy_limited)
+
+
 def plan_routes(
     coordinates: Sequence[tuple[float, float]],
     capacity: int,
@@ -1586,6 +1672,7 @@ def plan_routes(
     use_road_network: bool = True,
     average_speed_kmh: float = 32.0,
     vehicle_time_limits: Sequence[float] | None = None,
+    min_new_route_occupancy: float = MIN_NEW_ROUTE_OCCUPANCY,
 ) -> PlanResult:
     """İlk koordinatı fabrika, diğerlerini çalışan kabul ederek rota üretir."""
     if len(coordinates) < 2:
@@ -1594,6 +1681,8 @@ def plan_routes(
         raise ValueError("Araç kapasitesi sıfırdan büyük olmalıdır.")
     if direction not in {"morning", "evening"}:
         raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+    if not 0 < min_new_route_occupancy <= 1:
+        raise ValueError("min_new_route_occupancy 0 ile 1 arasında olmalıdır.")
 
     warnings: list[str] = []
     try:
@@ -1608,6 +1697,9 @@ def plan_routes(
 
     employee_count = len(coordinates) - 1
     minimum_vehicles = math.ceil(employee_count / capacity)
+    max_vehicle_count_by_occupancy = max_route_count_by_occupancy(
+        employee_count, capacity, min_new_route_occupancy
+    )
     if mode == "fixed":
         vehicle_count = fixed_vehicle_count
         if vehicle_count < minimum_vehicles:
@@ -1676,11 +1768,22 @@ def plan_routes(
                 f"rota üretilemedi ({details}). Otomatik servis sayısını deneyin."
             )
 
-        if vehicle_count >= employee_count:
-            raise ValueError(
-                "Her çalışan için ayrı araç varsayımında bile saha süre sınırı sağlanamadı. "
-                "Koordinat, durak veya süre benchmarkı kontrol edilmelidir."
+        # Doluluk eşiği nedeniyle daha fazla servis açılmasına izin verme.
+        # Bu durumda mevcut rota sayısı korunur; süre aşımı sonuçta açıkça
+        # uyarı olarak gösterilir.
+        if vehicle_count >= max_vehicle_count_by_occupancy:
+            warnings.append(
+                f"Yeni servis açılmadı: {vehicle_count + 1}. servis açılsaydı "
+                f"ortalama doluluk %"
+                f"{(employee_count / ((vehicle_count + 1) * capacity)) * 100:.0f} "
+                f"olacaktı ve minimum %"
+                f"{min_new_route_occupancy * 100:.0f} eşiğinin altında kalacaktı."
             )
+            warnings.append(
+                "Mevcut servis sayısı korunarak süre benchmarkını aşan rotalar "
+                "uyarı olarak gösterildi; gereksiz düşük doluluklu servis oluşturulmadı."
+            )
+            break
 
         vehicle_count += 1
         # Araç sayısı arttığında ilk 3 benchmark korunur; yeni araçlar

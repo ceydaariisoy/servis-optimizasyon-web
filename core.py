@@ -453,7 +453,7 @@ def update_routes_incrementally(
     walking_factor: float = 1.20,
     capacity: int = 40,
     direction: str = "morning",
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 0,
     max_route_minutes: float = 120.0,
     mode: str = "auto",
     use_road_network: bool = True,
@@ -1137,7 +1137,7 @@ def assign_common_stops_to_routes(
     capacity: int,
     duration_matrix: Sequence[Sequence[float]],
     direction: str = "morning",
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 0,
     max_route_minutes: float = 0,
     time_limit_seconds: int = 30,
     min_route_occupancy: int = 0,
@@ -1344,7 +1344,7 @@ def cluster_stops_geographically(
     duration_matrix: Sequence[Sequence[float]],
     direction: str,
     max_route_minutes: float,
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 0,
 ) -> list[list[CommonStop]]:
     """Mevcut ortak durakları coğrafi olarak bölüp her bölgeyi tek araca optimize eder.
 

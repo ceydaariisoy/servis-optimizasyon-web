@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.07-route-control-v4"
+APP_VERSION = "2026.09.07-route-control-v5"
 MIN_NEW_ROUTE_OCCUPANCY = 0.55
 BASELINE_ROUTE_LIMITS = {"morning": [50, 50, 57], "evening": [80, 65, 62]}
 FIXED_TARGET_AVERAGE_WALK_M = 400
@@ -414,7 +414,11 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 
 def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, str]], dict]:
-    """Durak Excel'ini okur; reddedilenleri dışlar ve onay durumunu sayar."""
+    """Mevcut durak Excel'ini okur ve Mevcut_Rota bilgisini durak etiketinde korur.
+
+    Eski arayüz uyumluluğu için üçlü tuple döndürülür: (enlem, boylam, etiket).
+    Etiket formatı: ``Karo 1 || DURAK ADI``.
+    """
     if uploaded_file is None:
         return [], {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     frame = pd.read_excel(BytesIO(uploaded_file.getvalue())).dropna(how="all")
@@ -423,16 +427,10 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, st
     if lat_col is None or lon_col is None:
         raise ValueError("Durak dosyasında `Enlem` ve `Boylam` sütunları bulunmalıdır.")
     normalized = {normalize(column): column for column in frame.columns}
-    name_col = next(
-        (
-            normalized[key]
-            for key in ("durak_adi", "durak_adı", "durak", "stop_name", "name")
-            if key in normalized
-        ),
-        None,
-    )
+    name_col = next((normalized[key] for key in ("durak_adi", "durak_adı", "durak", "stop_name", "name") if key in normalized), None)
+    route_col = normalized.get("mevcut_rota") or normalized.get("rota") or normalized.get("hat")
     status_col = normalized.get("saha_onayi") or normalized.get("onay_durumu")
-    candidates: list[tuple[float, float, str]] = []
+    candidates = []
     stats = {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     for row_no, (_, row) in enumerate(frame.iterrows(), start=1):
         lat = pd.to_numeric(row[lat_col], errors="coerce")
@@ -444,6 +442,9 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, st
             stats["excluded"] += 1
             continue
         label = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else f"Yüklenen durak {row_no}"
+        route = str(row[route_col]).strip() if route_col and not pd.isna(row[route_col]) else ""
+        if route:
+            label = f"{route} || {label}"
         candidates.append((float(lat), float(lon), label))
         stats["loaded"] += 1
         if status in {"onaylandi", "onayli", "evet", "uygun"}:
@@ -602,136 +603,202 @@ def materialize_shared_routes(
 
 
 def build_shared_routes(
-    employees: pd.DataFrame,
-    factory_coordinates: tuple[float, float],
-    max_walk_m: int,
-    target_average_walk_m: int,
-    direction: str,
-    capacity: int,
-    mode: str,
-    wait_seconds_per_stop: int,
-    max_route_minutes: int,
-    use_road_network: bool,
-    approved_candidates: list[tuple[float, float, str]],
-    allow_automatic_candidates: bool,
+    employees: pd.DataFrame, factory_coordinates: tuple[float, float], max_walk_m: int,
+    target_average_walk_m: int, direction: str, capacity: int, mode: str,
+    wait_seconds_per_stop: int, max_route_minutes: int, use_road_network: bool,
+    approved_candidates: list[tuple[float, float, str]], allow_automatic_candidates: bool,
 ):
-    """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
+    """V5: mevcut durakları koruyan, toplam süreyi doğrudan kullanan rota planlayıcı.
+
+    Öncelik sırası: yüklenen mevcut duraklar -> 3 mevcut servis -> gerekirse 4. servis.
+    Benchmark süreleri toplam servis süresi olduğundan durak başına ekstra bekleme eklenmez.
+    """
+    if capacity != 45:
+        capacity = int(capacity)
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
-    candidates = generate_candidate_stops(
-        employee_coordinates,
-        max_walk_m=max_walk_m,
-        walking_factor=1.20,
-        approved_candidates=approved_candidates,
-        allow_automatic_candidates=allow_automatic_candidates,
-    )
-    all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
-        employee_coordinates,
-        candidates,
-        max_walk_m=max_walk_m,
-        target_average_walk_m=target_average_walk_m,
-        walking_factor=1.20,
-    )
-    route_coordinates = [
-        factory_coordinates,
-        *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
-    ]
-    for matrix_index, stop in enumerate(all_stops, start=1):
-        stop.matrix_index = matrix_index
-    duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
-        route_coordinates,
-        use_road_network=use_road_network,
-    )
+    if not employee_coordinates:
+        raise ValueError("En az bir çalışan koordinatı gerekir.")
 
-    minimum_vehicle_count = math.ceil(len(employees) / capacity)
-    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
-    if vehicle_count < minimum_vehicle_count:
-        raise ValueError(
-            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
+    # 1) Yüklenen mevcut durakları doğrudan kullan. Her çalışanın 1000 m içinde
+    # kaldığı mevcut duraklar arasından en yakını seçilir. Böylece çalışan adresleri
+    # fiziksel servis durağına dönüştürülmez.
+    route_buckets = {1: [], 2: [], 3: []}
+    plain_candidates = []
+    for lat, lon, label in approved_candidates:
+        m = re.match(r"^Karo\s*([123])\s*\|\|\s*(.*)$", str(label), re.I)
+        if m:
+            route_buckets[int(m.group(1))].append((float(lat), float(lon), m.group(2).strip()))
+        else:
+            plain_candidates.append((float(lat), float(lon), str(label)))
+
+    # Rota bilgisi olmayan yüklenmiş duraklar da kullanılabilir; ancak mevcut hat
+    # bilgisi varsa onu bozmuyoruz.
+    if not any(route_buckets.values()) and plain_candidates:
+        # Eski dosya formatı için mevcut davranışa geri dön.
+        candidates = generate_candidate_stops(
+            employee_coordinates, max_walk_m=max_walk_m, walking_factor=1.20,
+            approved_candidates=approved_candidates, allow_automatic_candidates=allow_automatic_candidates,
         )
-
-    # Önce 3 servis denenir. Yeni servis gerekiyorsa yalnızca yeni açılan
-    # servis %55 (45 kapasitede 25 kişi) minimum doluluk şartına tabidir.
-    if mode == "fixed":
-        candidate_vehicle_counts = [3]
+        all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
+            employee_coordinates, candidates, max_walk_m=max_walk_m,
+            target_average_walk_m=target_average_walk_m, walking_factor=1.20,
+        )
     else:
-        preferred_count = max(3, minimum_vehicle_count)
-        min_new_route_load = math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY)
-        max_by_occupancy = len(employees) // min_new_route_load
-        # İş kuralı: mevcut 3 servis korunur; yalnızca gerektiğinde 1 yeni servis açılır.
-        # Böylece optimizasyon 5/6/7 düşük doluluklu servisler üretemez.
-        maximum_vehicle_count = min(4, max(minimum_vehicle_count, max_by_occupancy))
-        candidate_vehicle_counts = list(range(preferred_count, maximum_vehicle_count + 1))
+        assigned = set()
+        route_stops = []
+        for route_no in (1, 2, 3):
+            for lat, lon, label in route_buckets[route_no]:
+                members, walks = [], []
+                for idx, coord in enumerate(employee_coordinates):
+                    d = haversine_km((lat, lon), coord) * 1000 * 1.20
+                    if d <= max_walk_m and idx not in assigned:
+                        members.append(idx); walks.append(d)
+                if members:
+                    order = sorted(zip(members, walks), key=lambda x: (x[1], x[0]))
+                    members = [x[0] for x in order]; walks = [x[1] for x in order]
+                    route_stops.append(CommonStop(
+                        anchor_index=len(route_stops), member_indices=members, walking_distances_m=walks,
+                        latitude=lat, longitude=lon, label=label, source="Yüklenen mevcut durak"
+                    ))
+                    assigned.update(members)
+        remaining = [i for i in range(len(employee_coordinates)) if i not in assigned]
+        all_stops = route_stops
+        minimum_stop_count = len(all_stops)
+        minimum_proven = False
+        if remaining and allow_automatic_candidates:
+            rem_coords = [employee_coordinates[i] for i in remaining]
+            candidates = generate_candidate_stops(rem_coords, max_walk_m=max_walk_m, walking_factor=1.20,
+                approved_candidates=[], allow_automatic_candidates=True)
+            new_stops, _, _ = optimize_candidate_stops(rem_coords, candidates, max_walk_m=max_walk_m,
+                target_average_walk_m=target_average_walk_m, walking_factor=1.20)
+            for stop in new_stops:
+                stop.member_indices = [remaining[i] for i in stop.member_indices]
+                stop.source = stop.source
+            all_stops.extend(new_stops)
+        elif remaining:
+            raise ValueError(f"{len(remaining)} çalışan 1000 m içinde yüklenen mevcut duraklara atanamadı.")
 
-    last_error: Exception | None = None
+    if not all_stops:
+        raise ValueError("Çalışanların atanabileceği geçerli durak bulunamadı.")
+
+    route_coordinates = [factory_coordinates, *((float(s.latitude), float(s.longitude)) for s in all_stops)]
+    for i, stop in enumerate(all_stops, start=1):
+        stop.matrix_index = i
+    duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(route_coordinates, use_road_network=use_road_network)
+
+    # Benchmark gerçek toplam süre olduğu için wait_seconds_per_stop bilinçli olarak 0.
+    limits3 = list(BASELINE_ROUTE_LIMITS[direction])
+    if max_route_minutes:
+        limits3 = [min(float(x), float(max_route_minutes)) for x in limits3]
+
+    minimum_vehicle_count = math.ceil(len(employee_coordinates) / capacity)
+    if minimum_vehicle_count > 4:
+        raise ValueError("Mevcut modelde en fazla 3 ana servis + 1 ek servis planlanabilir.")
+
+    # Mevcut 3 hattın fiziksel duraklarını öncelikle kendi rotasında tut.
+    route_groups = {1: [], 2: [], 3: []}
+    for stop in all_stops:
+        label = stop.label
+        m = next((r for r in (1,2,3) if any(s[2] == label for s in route_buckets[r])), None)
+        if m is not None:
+            route_groups[m].append(stop)
+
+    def try_grouped() -> list[list[CommonStop]]:
+        routes = []
+        for r in (1,2,3):
+            group = route_groups[r]
+            if not group:
+                routes.append([]); continue
+            group_load = sum(s.passenger_count for s in group)
+            if group_load > capacity:
+                raise ValueError(f"Karo {r} mevcut duraklarına atanmış {group_load} kişi kapasiteyi aşıyor.")
+            routes.append(assign_common_stops_to_routes(
+                group, route_coordinates, 1, capacity, duration_matrix, direction,
+                wait_seconds_per_stop=0, max_route_minutes=limits3[r-1],
+                route_time_limits=[limits3[r-1]], time_limit_seconds=20,
+            )[0])
+        return routes
+
     allocated_routes = None
-    for vehicle_count in candidate_vehicle_counts:
-        if vehicle_count < minimum_vehicle_count:
-            continue
-        baseline_max = max(BASELINE_ROUTE_LIMITS[direction])
-        effective_limit = min(max_route_minutes, baseline_max) if max_route_minutes else baseline_max
-        # Mevcut hatların 50/50/57 veya 80/65/62 sırasını zorlamıyoruz;
-        # tüm yeni rotalar mevcut en uzun hattı aşamaz.
-        route_time_limits = [min(baseline_max, effective_limit)] * vehicle_count
+    last_error = None
+    try:
+        if any(route_groups.values()):
+            allocated_routes = try_grouped()
+    except ValueError as exc:
+        last_error = exc
+
+    # Mevcut hat dağılımı süreye sığmıyorsa, durakları koruyup yalnızca araçlara
+    # yeniden dağıtmayı OR-Tools'a bırak. Bu aşama 3 araçta kalmaya öncelik verir.
+    if allocated_routes is None:
         try:
-            # Önce durakları coğrafi bölgelere ayırıyoruz. Böylece OR-Tools tek dev
-            # modelde bütün Eskişehir'i aynı anda dağıtmak yerine her aracın doğal
-            # bölgesini çözüyor; bu, süre sınırı altında çok daha kararlı çalışıyor.
-            if vehicle_count >= 3:
-                allocated_routes = cluster_stops_geographically(
-                    all_stops,
-                    factory_coordinates,
-                    vehicle_count,
-                    capacity,
-                    duration_matrix,
-                    direction,
-                    effective_limit,
-                    wait_seconds_per_stop=wait_seconds_per_stop,
-                )
-                if vehicle_count > 3:
-                    loads = [sum(stop.passenger_count for stop in route) for route in allocated_routes]
-                    if max(loads, default=0) < math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY):
-                        raise ValueError("4 servis senaryosunda en az bir servis 25 kişi doluluk şartını sağlamıyor.")
-            else:
-                allocated_routes = assign_common_stops_to_routes(
-                    all_stops, route_coordinates, vehicle_count, capacity, duration_matrix, direction,
-                    wait_seconds_per_stop=wait_seconds_per_stop, max_route_minutes=effective_limit,
-                    new_route_min_occupancy=(math.ceil(capacity * MIN_NEW_ROUTE_OCCUPANCY) if vehicle_count > 3 else 0),
-                    route_time_limits=route_time_limits, time_limit_seconds=30,
-                )
-            break
+            allocated_routes = assign_common_stops_to_routes(
+                all_stops, route_coordinates, 3, capacity, duration_matrix, direction,
+                wait_seconds_per_stop=0, max_route_minutes=max(limits3),
+                route_time_limits=limits3, time_limit_seconds=45,
+            )
         except ValueError as exc:
             last_error = exc
-            continue
+
+    vehicle_count = 3
+    if allocated_routes is None and mode == "auto":
+        try:
+            # 4. rota artık 45 kişilik yeni bir ana servis olarak değil,
+            # yalnızca 3 ana servisin kapasite/süre dışında bıraktığı çalışanlar
+            # için "Ek Servis" olarak değerlendirilir. Minimum doluluk şartı yoktur.
+            limit4 = max(limits3)
+            allocated_routes = assign_common_stops_to_routes(
+                all_stops, route_coordinates, 4, capacity, duration_matrix, direction,
+                wait_seconds_per_stop=0, max_route_minutes=limit4,
+                route_time_limits=[*limits3, limit4], time_limit_seconds=60,
+            )
+            vehicle_count = 4
+        except ValueError as exc:
+            last_error = exc
 
     if allocated_routes is None:
-        detail = str(last_error) if last_error else "Optimizasyon çözücü uygulanabilir rota bulamadı."
         raise ValueError(
-            "3 servis mevcut süre sınırları içinde çözülemedi. "
-            "Gerektiğinde yalnızca 4. servis denenebilir ve bu servis en az %55 dolu (25 kişi) olmalıdır. "
-            "5. ve üzeri servis açılmaz. 1000 m yürüme sınırı ve yüklenen durak önceliği korunur. "
-            f"Son teknik neden: {detail}"
+            "3 servis mevcut toplam süre sınırları içinde çözülemedi; 4. servis de "
+            "en az 25 kişi şartıyla uygulanabilir bir çözüm üretemedi. "
+            f"Teknik neden: {last_error}"
         ) from last_error
 
-    shared_routes = materialize_shared_routes(
-        allocated_routes,
-        duration_matrix,
-        distance_matrix,
-        direction,
-        wait_seconds_per_stop,
-    )
-    if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
-        warnings.append(
-            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
-        )
+    shared_routes = materialize_shared_routes(allocated_routes, duration_matrix, distance_matrix, direction, 0)
+    # 4. rota varsa onu ana servis değil, ek/küçük servis olarak işaretle.
+    if vehicle_count == 4:
+        nonempty = [r for r in shared_routes if r["occupancy"] > 0]
+        if nonempty:
+            extra_route = min(nonempty, key=lambda r: r["occupancy"])
+            extra_route["service_type"] = "Ek/Küçük Servis"
+            extra_route["required_capacity"] = extra_route["occupancy"]
+            extra_route["vehicle_no_label"] = "Ek Servis"
+            for r in shared_routes:
+                if r is not extra_route:
+                    r["service_type"] = "Ana Servis"
+                    r["required_capacity"] = capacity
+        else:
+            for r in shared_routes:
+                r["service_type"] = "Ana Servis"
+                r["required_capacity"] = capacity
+    else:
+        for r in shared_routes:
+            r["service_type"] = "Ana Servis"
+            r["required_capacity"] = capacity
+
+    for i, route in enumerate(shared_routes):
+        limit = limits3[i] if i < 3 else max(limits3)
+        if route["total_minutes"] > limit + 0.01:
+            raise ValueError(f"Rota {i+1} toplam süresi {route['total_minutes']:.1f} dk ile {limit:.0f} dk sınırını aşıyor.")
+
+    extra_service_passengers = next((r["occupancy"] for r in shared_routes if r.get("service_type") == "Ek/Küçük Servis"), 0)
     meta = {
-        "vehicle_count": vehicle_count,
-        "candidate_count": len(candidates),
-        "minimum_stop_count": minimum_stop_count,
-        "minimum_proven": minimum_proven,
-        "selected_stop_count": len(all_stops),
-        "matrix_source": matrix_source,
-        "warnings": warnings,
-        "planning_mode": "full",
+        "vehicle_count": vehicle_count, "candidate_count": len(approved_candidates),
+        "extra_service_passengers": extra_service_passengers,
+        "extra_service_needed": extra_service_passengers > 0,
+        "minimum_stop_count": minimum_stop_count, "minimum_proven": minimum_proven,
+        "selected_stop_count": len(all_stops), "matrix_source": matrix_source,
+        "warnings": warnings, "planning_mode": "route_preserving_v5",
+        "preserved_route_structure": bool(any(route_buckets.values())),
+        "wait_seconds_per_stop": 0,
     }
     return shared_routes, meta
 
@@ -786,8 +853,9 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
         summary_rows.append(
             {
                 "Rota": f"Rota {route['vehicle_no']}",
+                "Servis_Tipi": route.get("service_type", "Ana Servis"),
                 "Yolcu": route["occupancy"],
-                "Kapasite": capacity,
+                "Kapasite": route.get("required_capacity", capacity),
                 "Doluluk_Orani": route["occupancy"] / capacity,
                 "Toplam_Durak_Sayisi": len(route["stops"]),
                 "Coklu_Ortak_Durak": sum(stop["passenger_count"] > 1 for stop in route["stops"]),
@@ -920,7 +988,7 @@ with st.sidebar:
             format="%d dk",
             help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
         )
-        wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
+        wait_seconds_per_stop = 0
 
     with st.expander("Sefer ve yol hesabı", expanded=True):
         direction_label = st.selectbox(
@@ -1176,7 +1244,7 @@ if shared_routes is None:
     st.error("Rota sonucu bulunamadı. Optimizasyonu yeniden çalıştırın.")
     st.stop()
 optimized_vehicle_count = result["vehicle_count"]
-result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
+result_wait_seconds = st.session_state.get("result_wait_seconds", 0)
 result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
 result_target_average_walk_m = st.session_state.get(
     "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
@@ -1222,6 +1290,14 @@ r1.metric("Önerilen servis", optimized_vehicle_count)
 r2.metric("Toplam çalışan", len(employees))
 r3.metric("Toplam durak", total_stop_count)
 r4.metric("Ortalama doluluk", f"%{avg_fill * 100:.0f}")
+
+extra_service_passengers = result.get("extra_service_passengers", 0)
+if extra_service_passengers:
+    st.warning(
+        f"3 ana servis yeterli olmadı. {extra_service_passengers} çalışan için ek servis ihtiyacı oluştu. "
+        f"Önerilen minimum araç kapasitesi: {extra_service_passengers} kişi. "
+        "Bu servis 45 kişilik büyük araç olmak zorunda değildir."
+    )
 s1, s2, s3, s4 = st.columns(4)
 s1.metric("Ortalama yürüme", f"{average_walk:.0f} m")
 s2.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
@@ -1257,13 +1333,13 @@ if result.get("planning_mode") == "incremental":
     st.caption(
         f"Artımlı güncelleme: önceki duraklar ve sıraları korunarak {result_max_walk_m} m yürüme, "
         f"{result_capacity} kişi kapasite, durak başına {result_wait_seconds} sn bekleme ve "
-        f"{result_max_route_minutes} dk rota sınırı uygulandı. Yeni otomatik noktalar saha onayı gerektirir."
+        f"{result_max_route_minutes} dk rota sınırı uygulandı. Mevcut toplam servis sürelerine ek durak bekleme süresi eklenmez. Yeni otomatik noktalar saha onayı gerektirir."
     )
 else:
     st.caption(
         f"Hesaplama: {result_max_walk_m} m azami yürüyüş, "
         f"{result_target_average_walk_m} m sabit konfor hedefi, "
-        f"durak başına {result_wait_seconds} sn bekleme ve "
+        f"ek durak bekleme süresi eklenmeden ve "
         f"{result_max_route_minutes} dk azami rota süresi."
     )
 

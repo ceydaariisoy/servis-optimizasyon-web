@@ -795,57 +795,63 @@ def build_shared_routes(
             require_all_vehicles_used=False,
         )
 
-    def validate_paired_solution(morning_routes):
+    def validate_paired_solution(morning_routes, morning_limit=MORNING_MAX_MINUTES, evening_limit=EVENING_MAX_MINUTES):
         """Aynı duraklar sabah ve ters sırada akşam 60 dk sınırında mı?"""
         if len(active(morning_routes)) != len(morning_routes):
             return None
 
         morning_shared = route_durations(morning_routes, "morning")
-        if not all_within_limit(morning_shared, MORNING_MAX_MINUTES):
+        if not all_within_limit(morning_shared, morning_limit):
             return None
 
         evening_routes = reverse_for_return(morning_routes)
         evening_shared = route_durations(evening_routes, "evening")
-        if not all_within_limit(evening_shared, EVENING_MAX_MINUTES):
+        if not all_within_limit(evening_shared, evening_limit):
             return None
 
         return evening_routes, morning_shared, evening_shared
 
-    # Önce 3 rota: sabah <=50 dk ve aynı güzergâhın tersinden akşam <=60 dk.
-    for vehicle_count in (3, 4):
-        try:
-            morning_routes = try_morning(vehicle_count)
-            # OR-Tools 4 araç tanımlı olsa bile bazı araçları boş bırakabilir.
-            # 4 servis kararı yalnızca gerçekten 4 aktif rota varsa kabul edilir.
-            active_route_count = sum(1 for route in morning_routes if route)
-            if vehicle_count == 4 and active_route_count < 4:
-                continue
-            paired = validate_paired_solution(morning_routes)
+    # 3 servis: mevcut süreleri aşmadan toplam süreyi iyileştirmeye çalış.
+    # Sabah mevcut sınırlar 50/50/57, akşam 80/65/62 dk.
+    try:
+        morning_routes = try_morning(3)
+        if sum(1 for route in morning_routes if route) == 3:
+            paired = validate_paired_solution(morning_routes, morning_limit=max(benchmark), evening_limit=max(CURRENT_ROUTE_BENCHMARKS["evening"]))
             if paired is not None:
                 evening_routes, morning_shared, evening_shared = paired
-                # Kullanıcının seçtiği yöne göre gösterilecek rota.
-                selected_routes = (
-                    morning_routes if direction == "morning" else evening_routes
-                )
-                result_routes, meta = finish(
-                    selected_routes,
-                    vehicle_count,
-                    f"paired_{vehicle_count}",
-                )
-                meta["morning_route_minutes"] = [
-                    round(float(route["total_minutes"]), 1)
-                    for route in morning_shared
-                ]
-                meta["evening_route_minutes"] = [
-                    round(float(route["total_minutes"]), 1)
-                    for route in evening_shared
-                ]
-                meta["route_rule"] = (
-                    "Sabah ≤50 dk; akşam aynı güzergâh ters sırada ≤60 dk."
-                )
+                morning_vals = [float(r["total_minutes"]) for r in morning_shared]
+                evening_vals = [float(r["total_minutes"]) for r in evening_shared]
+                if (all(morning_vals[i] <= benchmark[i] + 0.01 for i in range(3))
+                    and all(evening_vals[i] <= CURRENT_ROUTE_BENCHMARKS["evening"][i] + 0.01 for i in range(3))
+                    and sum(morning_vals) + sum(evening_vals) < sum(benchmark) + sum(CURRENT_ROUTE_BENCHMARKS["evening"]) - 0.01):
+                    selected_routes = morning_routes if direction == "morning" else evening_routes
+                    result_routes, meta = finish(selected_routes, 3, "optimized_3")
+                    meta["morning_route_minutes"] = [round(x,1) for x in morning_vals]
+                    meta["evening_route_minutes"] = [round(x,1) for x in evening_vals]
+                    meta["route_rule"] = "3 servis mevcut sürelerden daha kısa; 4 servis yalnızca gerekirse kullanılır."
+                    return result_routes, meta
+    except ValueError:
+        pass
+
+    # 4 servis: gerçek operasyon sınırı sabah 50 dk, akşam 60 dk.
+    try:
+        morning_routes = assign_common_stops_to_routes(
+            all_stops, route_coordinates, vehicle_count=4, capacity=capacity,
+            duration_matrix=duration_matrix, direction="morning", wait_seconds_per_stop=0,
+            max_route_minutes=50, time_limit_seconds=60, require_all_vehicles_used=False,
+        )
+        if sum(1 for route in morning_routes if route) == 4:
+            paired = validate_paired_solution(morning_routes, 50, 60)
+            if paired is not None:
+                evening_routes, morning_shared, evening_shared = paired
+                selected_routes = morning_routes if direction == "morning" else evening_routes
+                result_routes, meta = finish(selected_routes, 4, "fallback_4")
+                meta["morning_route_minutes"] = [round(float(r["total_minutes"]),1) for r in morning_shared]
+                meta["evening_route_minutes"] = [round(float(r["total_minutes"]),1) for r in evening_shared]
+                meta["route_rule"] = "4 servis: sabah ≤50 dk, akşam aynı güzergâh ters sırada ≤60 dk."
                 return result_routes, meta
-        except ValueError:
-            continue
+    except ValueError:
+        pass
 
     # 3/4 tam servisle iki yönlü süre sınırı birlikte sağlanamadıysa,
     # 3 ana servis + yalnızca açıkta kalan çalışanlar için tek ek servis denenir.
@@ -858,7 +864,7 @@ def build_shared_routes(
             duration_matrix=duration_matrix,
             direction="morning",
             wait_seconds_per_stop=0,
-            max_route_minutes=MORNING_MAX_MINUTES,
+            max_route_minutes=max(benchmark),
             time_limit_seconds=30,
         )
     except ValueError as exc:

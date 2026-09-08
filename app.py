@@ -16,11 +16,12 @@ from core import (
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
+    reverse_routes_for_return,
     update_routes_incrementally,
 )
 
 
-APP_VERSION = "2026.08.24-professional-ui-v2"
+APP_VERSION = "2026.09.08-same-route-morning-evening-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 45
 
@@ -612,7 +613,17 @@ def build_shared_routes(
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
 ):
-    """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
+    """
+    Ortak durakları ve servis rotalarını oluşturur.
+
+    GELİŞ / DÖNÜŞ KURALI:
+    Akşam seferi sabahdan bağımsız yeniden optimize edilmez.
+    Sabahda oluşturulan Rota 1, Rota 2, ... aynı araç/çalışan grubuyla
+    korunur; akşam yalnızca durak sırası ters çevrilir.
+
+    Sabah: Durak A -> Durak B -> Fabrika
+    Akşam: Fabrika -> Durak B -> Durak A
+    """
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
     candidates = generate_candidate_stops(
         employee_coordinates,
@@ -638,7 +649,6 @@ def build_shared_routes(
         route_coordinates,
         use_road_network=use_road_network,
     )
-
     minimum_vehicle_count = math.ceil(len(employees) / capacity)
     vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
     if vehicle_count < minimum_vehicle_count:
@@ -646,8 +656,10 @@ def build_shared_routes(
             f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
         )
 
-    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
-    # sağlanmıyorsa araç sayısı birer artırılır.
+    # Rota dağılımı HER ZAMAN sabah yönüne göre çözülür.
+    # Böylece akşam yönü çalışanları başka araçlara taşıyamaz.
+    planning_direction = "morning"
+
     last_error: Exception | None = None
     maximum_vehicle_count = max(
         vehicle_count,
@@ -661,7 +673,7 @@ def build_shared_routes(
                 vehicle_count,
                 capacity,
                 duration_matrix,
-                direction,
+                planning_direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=max_route_minutes,
             )
@@ -677,6 +689,10 @@ def build_shared_routes(
             "Azami rota süresini artırın veya kapasiteyi kontrol edin."
         ) from last_error
 
+    # Akşamda sabahda bulunan aynı rota grubu korunur; yalnızca sıra ters çevrilir.
+    if direction == "evening":
+        allocated_routes = reverse_routes_for_return(allocated_routes)
+
     shared_routes = materialize_shared_routes(
         allocated_routes,
         duration_matrix,
@@ -688,6 +704,9 @@ def build_shared_routes(
         warnings.append(
             "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
         )
+    warnings.append(
+        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+    )
     meta = {
         "vehicle_count": vehicle_count,
         "candidate_count": len(candidates),
@@ -697,9 +716,9 @@ def build_shared_routes(
         "matrix_source": matrix_source,
         "warnings": warnings,
         "planning_mode": "full",
+        "same_route_morning_evening": True,
     }
     return shared_routes, meta
-
 
 def build_incremental_shared_routes(
     employees: pd.DataFrame,
@@ -716,7 +735,13 @@ def build_incremental_shared_routes(
     approved_candidates: list[tuple[float, float, str]],
     allow_automatic_candidates: bool,
 ):
+    """Mevcut planı günceller; geliş/dönüşte aynı rota numarası korunur."""
     employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
+
+    # Önceki planın rota yapısı sabah yönünde tutulur.
+    # Akşam sonucu en sonda ters çevrilir.
+    planning_direction = "morning"
+
     allocated_routes, duration_matrix, distance_matrix, meta = update_routes_incrementally(
         employee_coordinates=employee_coordinates,
         baseline_routes=baseline_routes,
@@ -726,13 +751,17 @@ def build_incremental_shared_routes(
         target_average_walk_m=target_average_walk_m,
         walking_factor=1.20,
         capacity=capacity,
-        direction=direction,
+        direction=planning_direction,
         wait_seconds_per_stop=wait_seconds_per_stop,
         max_route_minutes=max_route_minutes,
         mode=mode,
         use_road_network=use_road_network,
         allow_automatic_candidates=allow_automatic_candidates,
     )
+
+    if direction == "evening":
+        allocated_routes = reverse_routes_for_return(allocated_routes)
+
     shared_routes = materialize_shared_routes(
         allocated_routes,
         duration_matrix,
@@ -740,8 +769,11 @@ def build_incremental_shared_routes(
         direction,
         wait_seconds_per_stop,
     )
+    meta["same_route_morning_evening"] = True
+    meta.setdefault("warnings", []).append(
+        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+    )
     return shared_routes, meta
-
 
 def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> bytes:
     summary_rows = []
@@ -893,6 +925,11 @@ with st.sidebar:
                 "Sabah (08.00 varış): çalışan → fabrika",
                 "Akşam (17.30 çıkış): fabrika → çalışan",
             ],
+        )
+        st.info(
+            "🔒 Geliş ve dönüş aynı servis rotasını kullanır. "
+            "Sabah Rota 1'e atanan çalışanlar akşam da Rota 1'de kalır; "
+            "akşam durak sırası sabah rotasının tersidir."
         )
         use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
         road_consent = False

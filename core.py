@@ -1114,6 +1114,17 @@ def _allocate_unsplit_common_stops(
     return routes
 
 
+def reverse_routes_for_return(
+    routes: Sequence[Sequence[CommonStop]],
+) -> list[list[CommonStop]]:
+    """Return the exact same route groups with each route's stop order reversed.
+
+    This is used for the evening return trip so employees stay on the same
+    route/vehicle as in the morning; only the travel direction changes.
+    """
+    return [list(reversed(route)) for route in routes]
+
+
 def assign_common_stops_to_routes(
     stops: Sequence[CommonStop],
     coordinates: Sequence[tuple[float, float]],

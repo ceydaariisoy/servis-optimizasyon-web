@@ -1324,6 +1324,12 @@ def parse_kml_points(file_bytes: bytes, filename: str = "harita.kml") -> list[di
     return points
 
 
+
+def reverse_routes_for_return(routes: Sequence[Sequence[CommonStop]]) -> list[list[CommonStop]]:
+    """Sabah rota gruplarını koruyup akşam için durak sırasını tersine çevirir."""
+    return [list(reversed(route)) for route in routes]
+
+
 def _route_path(employee_indices: Sequence[int], direction: str) -> list[int]:
     if direction == "morning":
         return [*employee_indices, 0]

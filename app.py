@@ -665,6 +665,10 @@ def build_shared_routes(
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=max_route_minutes,
             )
+            # OR-Tools verilen araçların bir kısmını boş bırakabilir.
+            # Boş araç servis değildir; sonuç, Excel ve doluluk hesabında gerçek rota sayısını kullan.
+            allocated_routes = [route for route in allocated_routes if route]
+            vehicle_count = len(allocated_routes)
             break
         except ValueError as exc:
             last_error = exc
@@ -1139,9 +1143,8 @@ shared_routes = st.session_state.get("shared_routes")
 if shared_routes is None:
     st.error("Rota sonucu bulunamadı. Optimizasyonu yeniden çalıştırın.")
     st.stop()
-optimized_vehicle_count = result["vehicle_count"]
 result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
-result_max_route_minutes = st.session_state.get("result_max_route_minutes", 70)
+result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
 result_target_average_walk_m = st.session_state.get(
     "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
 )
@@ -1158,6 +1161,8 @@ for warning in result.get("warnings", []):
         st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
 
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
+optimized_vehicle_count = len(nonempty_routes)
+result["vehicle_count"] = optimized_vehicle_count
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
 automatic_stop_count = sum(

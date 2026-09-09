@@ -16,13 +16,16 @@ from core import (
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
+    reverse_routes_for_return,
     update_routes_incrementally,
 )
 
 
-APP_VERSION = "2026.08.24-professional-ui-v2"
+APP_VERSION = "2026.09.09-route-corridor-0755-schedule-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
-FIXED_WAIT_SECONDS_PER_STOP = 45
+FIXED_WAIT_SECONDS_PER_STOP = 15
+MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
+EVENING_FACTORY_DEPARTURE_SECONDS = 17 * 3600 + 40 * 60
 
 
 st.set_page_config(
@@ -240,7 +243,7 @@ st.markdown(
     }
     .route-stat-grid {
         display: grid;
-        grid-template-columns: repeat(5, minmax(80px, 1fr));
+        grid-template-columns: repeat(6, minmax(80px, 1fr));
         gap: 0.75rem;
     }
     .route-stat strong {
@@ -410,8 +413,8 @@ def standardize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out
 
 
-def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, str]], dict]:
-    """Durak Excel'ini okur; reddedilenleri dışlar ve onay durumunu sayar."""
+def read_approved_candidates(uploaded_file) -> tuple[list[tuple], dict]:
+    """Durak Excel'ini okur; rota/grup bilgisini korur ve reddedilenleri dışlar."""
     if uploaded_file is None:
         return [], {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     frame = pd.read_excel(BytesIO(uploaded_file.getvalue())).dropna(how="all")
@@ -428,8 +431,16 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, st
         ),
         None,
     )
+    route_col = next(
+        (
+            normalized[key]
+            for key in ("mevcut_rota", "rota", "route", "hat", "servis_hatti")
+            if key in normalized
+        ),
+        None,
+    )
     status_col = normalized.get("saha_onayi") or normalized.get("onay_durumu")
-    candidates: list[tuple[float, float, str]] = []
+    candidates: list[tuple] = []
     stats = {"loaded": 0, "approved": 0, "pending": 0, "excluded": 0}
     for row_no, (_, row) in enumerate(frame.iterrows(), start=1):
         lat = pd.to_numeric(row[lat_col], errors="coerce")
@@ -441,7 +452,10 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, st
             stats["excluded"] += 1
             continue
         label = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else f"Yüklenen durak {row_no}"
-        candidates.append((float(lat), float(lon), label))
+        route_group = str(row[route_col]).strip() if route_col and not pd.isna(row[route_col]) else ""
+        # Dördüncü alan mevcut rota bilgisidir. core.py bu bilgiyi yalnızca
+        # güzergâh segmentlerini doğru kurmak için kullanır; durak adı değişmez.
+        candidates.append((float(lat), float(lon), label, route_group))
         stats["loaded"] += 1
         if status in {"onaylandi", "onayli", "evet", "uygun"}:
             stats["approved"] += 1
@@ -450,7 +464,6 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple[float, float, st
     if not candidates and not stats["excluded"]:
         raise ValueError("Durak dosyasında geçerli koordinat bulunamadı.")
     return candidates, stats
-
 
 def normalize_employee_id(value: object) -> str:
     """Excel'in 123, 123.0 ve metin biçimlerini aynı sicil olarak eşleştirir."""
@@ -540,6 +553,49 @@ def read_previous_routes(uploaded_file, employees: pd.DataFrame) -> list[list[Co
     return [route_map[number] for number in sorted(route_map)]
 
 
+def _format_clock(seconds_from_midnight: float) -> str:
+    """Saniye cinsinden günü HH:MM biçimine yuvarlar."""
+    rounded_minutes = int((float(seconds_from_midnight) + 30) // 60) % (24 * 60)
+    return f"{rounded_minutes // 60:02d}:{rounded_minutes % 60:02d}"
+
+
+def _route_stop_schedule_seconds(
+    ordered_matrix_indices: list[int],
+    duration_matrix: list[list[float]],
+    direction: str,
+    wait_seconds_per_stop: int,
+) -> tuple[list[float], float]:
+    """Durak saatlerini 07:55 fabrika varışı / 17:40 fabrika çıkışına göre hesaplar."""
+    if not ordered_matrix_indices:
+        anchor = (
+            MORNING_FACTORY_ARRIVAL_SECONDS
+            if direction == "morning"
+            else EVENING_FACTORY_DEPARTURE_SECONDS
+        )
+        return [], float(anchor)
+
+    if direction == "morning":
+        cursor = float(MORNING_FACTORY_ARRIVAL_SECONDS)
+        arrivals = [0.0] * len(ordered_matrix_indices)
+        for position in range(len(ordered_matrix_indices) - 1, -1, -1):
+            current_index = ordered_matrix_indices[position]
+            next_index = 0 if position == len(ordered_matrix_indices) - 1 else ordered_matrix_indices[position + 1]
+            cursor -= float(duration_matrix[current_index][next_index])
+            cursor -= float(wait_seconds_per_stop)
+            arrivals[position] = cursor
+        return arrivals, float(MORNING_FACTORY_ARRIVAL_SECONDS)
+
+    cursor = float(EVENING_FACTORY_DEPARTURE_SECONDS)
+    arrivals: list[float] = []
+    previous_index = 0
+    for current_index in ordered_matrix_indices:
+        cursor += float(duration_matrix[previous_index][current_index])
+        arrivals.append(cursor)
+        cursor += float(wait_seconds_per_stop)
+        previous_index = current_index
+    return arrivals, float(EVENING_FACTORY_DEPARTURE_SECONDS)
+
+
 def materialize_shared_routes(
     allocated_routes: list[list[CommonStop]],
     duration_matrix: list[list[float]],
@@ -573,6 +629,15 @@ def materialize_shared_routes(
             )
 
         ordered_matrix_indices = [stop["anchor_matrix_index"] for stop in stops]
+        schedule_seconds, factory_anchor_seconds = _route_stop_schedule_seconds(
+            ordered_matrix_indices,
+            duration_matrix,
+            direction,
+            wait_seconds_per_stop,
+        )
+        for stop, scheduled_seconds in zip(stops, schedule_seconds):
+            stop["scheduled_seconds"] = scheduled_seconds
+            stop["scheduled_time"] = _format_clock(scheduled_seconds)
         path_indices = [*ordered_matrix_indices, 0] if direction == "morning" else [0, *ordered_matrix_indices]
         drive_seconds = sum(duration_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
         distance_meters = sum(distance_matrix[a][b] for a, b in zip(path_indices, path_indices[1:]))
@@ -584,6 +649,8 @@ def materialize_shared_routes(
         shared_routes.append(
             {
                 "vehicle_no": vehicle_no,
+                "direction": direction,
+                "factory_time": _format_clock(factory_anchor_seconds),
                 "occupancy": sum(stop["passenger_count"] for stop in stops),
                 "stops": stops,
                 "path_indices": path_indices,
@@ -598,6 +665,65 @@ def materialize_shared_routes(
     return shared_routes
 
 
+def _allocated_route_total_minutes(
+    route: list[CommonStop],
+    duration_matrix: list[list[float]],
+    direction: str,
+    wait_seconds_per_stop: int,
+) -> float:
+    """Aynı rota grubunun verilen yöndeki sürüş + durak bekleme süresini hesaplar."""
+    if not route:
+        return 0.0
+    matrix_indices = [
+        stop.matrix_index if stop.matrix_index is not None else stop.anchor_index + 1
+        for stop in route
+    ]
+    path = [*matrix_indices, 0] if direction == "morning" else [0, *matrix_indices]
+    drive_seconds = sum(
+        float(duration_matrix[a][b])
+        for a, b in zip(path, path[1:])
+    )
+    return drive_seconds / 60.0 + len(route) * wait_seconds_per_stop / 60.0
+
+
+def _same_route_directional_times(
+    morning_routes: list[list[CommonStop]],
+    duration_matrix: list[list[float]],
+    wait_seconds_per_stop: int,
+) -> tuple[list[float], list[float]]:
+    """Aynı çalışan/araç grubu için sabah ve ters akşam sürelerini birlikte hesaplar."""
+    morning_times = []
+    evening_times = []
+    for route in morning_routes:
+        if not route:
+            continue
+        morning_times.append(
+            _allocated_route_total_minutes(
+                route, duration_matrix, "morning", wait_seconds_per_stop
+            )
+        )
+        evening_times.append(
+            _allocated_route_total_minutes(
+                list(reversed(route)), duration_matrix, "evening", wait_seconds_per_stop
+            )
+        )
+    return morning_times, evening_times
+
+
+def _direction_limit_violation_text(
+    morning_times: list[float],
+    evening_times: list[float],
+    max_route_minutes: int,
+) -> str:
+    violations = []
+    for route_no, (morning, evening) in enumerate(zip(morning_times, evening_times), start=1):
+        if morning > max_route_minutes + 1e-9 or evening > max_route_minutes + 1e-9:
+            violations.append(
+                f"Rota {route_no}: sabah {morning:.1f} dk / akşam {evening:.1f} dk"
+            )
+    return "; ".join(violations)
+
+
 def build_shared_routes(
     employees: pd.DataFrame,
     factory_coordinates: tuple[float, float],
@@ -609,17 +735,29 @@ def build_shared_routes(
     wait_seconds_per_stop: int,
     max_route_minutes: int,
     use_road_network: bool,
-    approved_candidates: list[tuple[float, float, str]],
+    approved_candidates: list[tuple],
     allow_automatic_candidates: bool,
 ):
-    """SBRP-BSS yaklaşımıyla aday durak, atama ve kapasite kısıtlı rotaları kurar."""
-    employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
+    """
+    Ortak durakları ve servis rotalarını oluşturur.
+
+    Temel kurallar:
+    - Rota grupları sabah yönünde optimize edilir.
+    - Akşam aynı çalışanlar aynı serviste kalır; yalnızca durak sırası ters çevrilir.
+    - Azami rota süresi hem sabah hem akşam için HARD constraint olarak doğrulanır.
+    - Otomatik modda sınır sağlanmıyorsa araç sayısı artırılır.
+    - OR-Tools'un boş bıraktığı araçlar sonuçtan kaldırılır; ekranda gerçek aktif rota sayısı gösterilir.
+    """
+    employee_coordinates = list(
+        zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float))
+    )
     candidates = generate_candidate_stops(
         employee_coordinates,
         max_walk_m=max_walk_m,
         walking_factor=1.20,
         approved_candidates=approved_candidates,
         allow_automatic_candidates=allow_automatic_candidates,
+        factory_coordinates=factory_coordinates,
     )
     all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
         employee_coordinates,
@@ -634,6 +772,7 @@ def build_shared_routes(
     ]
     for matrix_index, stop in enumerate(all_stops, start=1):
         stop.matrix_index = matrix_index
+
     duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
         route_coordinates,
         use_road_network=use_road_network,
@@ -646,54 +785,102 @@ def build_shared_routes(
             f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
         )
 
-    # Otomatik modda kapasiteyi karşılayan en küçük sayıdan başlanır. Süre sınırı
-    # sağlanmıyorsa araç sayısı birer artırılır.
+    # Aynı servis grubu geliş/dönüşte korunduğu için dağılım HER ZAMAN sabah yönünde çözülür.
+    planning_direction = "morning"
     last_error: Exception | None = None
+    last_direction_violation = ""
     maximum_vehicle_count = max(
         vehicle_count,
-        min(len(all_stops), minimum_vehicle_count + 5),
+        min(len(all_stops), minimum_vehicle_count + 8),
     )
+
     while vehicle_count <= maximum_vehicle_count:
         try:
-            allocated_routes = assign_common_stops_to_routes(
+            candidate_routes = assign_common_stops_to_routes(
                 all_stops,
                 route_coordinates,
                 vehicle_count,
                 capacity,
                 duration_matrix,
-                direction,
+                planning_direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=max_route_minutes,
+                time_limit_seconds=15,
             )
-            # OR-Tools verilen araçların bir kısmını boş bırakabilir.
-            # Boş araç servis değildir; sonuç, Excel ve doluluk hesabında gerçek rota sayısını kullan.
-            allocated_routes = [route for route in allocated_routes if route]
+
+            # Boş araçlar servis değildir. Bunları hemen çıkarıp gerçek rota sayısını kullanıyoruz.
+            active_candidate_routes = [route for route in candidate_routes if route]
+            if not active_candidate_routes and len(employees):
+                raise ValueError("Optimizasyon aktif bir servis rotası üretemedi.")
+
+            morning_times, evening_times = _same_route_directional_times(
+                active_candidate_routes,
+                duration_matrix,
+                wait_seconds_per_stop,
+            )
+            last_direction_violation = _direction_limit_violation_text(
+                morning_times, evening_times, max_route_minutes
+            )
+
+            # OR-Tools sabah sınırını model içinde uygular. Burada ayrıca aynı rota grubunun
+            # ters akşam seferini de kontrol ediyoruz. Böylece 70 dk iki yön için de gerçek sınırdır.
+            if max_route_minutes and last_direction_violation:
+                if mode == "fixed":
+                    raise ValueError(
+                        f"Sabit 3 servis ile {max_route_minutes} dk sınırı her iki yönde sağlanamıyor. "
+                        f"{last_direction_violation}. Rota sayısını Otomatik seçin."
+                    )
+                vehicle_count += 1
+                continue
+
+            allocated_routes = active_candidate_routes
             vehicle_count = len(allocated_routes)
             break
+
         except ValueError as exc:
             last_error = exc
             if mode == "fixed":
                 raise
             vehicle_count += 1
     else:
+        detail = f" Son kontrol: {last_direction_violation}." if last_direction_violation else ""
         raise ValueError(
-            "Kapasite ve rota süresi sınırlarını birlikte sağlayan çözüm bulunamadı. "
-            "Azami rota süresini artırın veya kapasiteyi kontrol edin."
+            f"Kapasite ve {max_route_minutes} dk sabah/akşam rota süresi sınırlarını "
+            f"birlikte sağlayan çözüm bulunamadı.{detail} "
+            "Araç kapasitesini veya durak yapısını kontrol edin."
         ) from last_error
 
+    # Nihai süreleri aktif sabah rota grupları üzerinden sakla.
+    morning_times, evening_times = _same_route_directional_times(
+        allocated_routes, duration_matrix, wait_seconds_per_stop
+    )
+
+    # Kullanıcı akşam görünümünü seçerse aynı rota gruplarını ters sırada göster.
+    output_routes = (
+        reverse_routes_for_return(allocated_routes)
+        if direction == "evening"
+        else allocated_routes
+    )
     shared_routes = materialize_shared_routes(
-        allocated_routes,
+        output_routes,
         duration_matrix,
         distance_matrix,
         direction,
         wait_seconds_per_stop,
     )
-    if any(stop.source in {"Otomatik ortak nokta", "Çalışan adresi"} for stop in all_stops):
+
+    if any(stop.source in {"Otomatik ortak nokta", "Güzergâh üzeri aday durak", "Güzergâha yakın yeni durak"} for stop in all_stops):
         warnings.append(
-            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve güvenli bekleme alanı sahada onaylanmalıdır."
+            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve "
+            "güvenli bekleme alanı sahada onaylanmalıdır."
         )
+    warnings.append(
+        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar "
+        "başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+    )
+
     meta = {
-        "vehicle_count": vehicle_count,
+        "vehicle_count": len(allocated_routes),
         "candidate_count": len(candidates),
         "minimum_stop_count": minimum_stop_count,
         "minimum_proven": minimum_proven,
@@ -701,6 +888,10 @@ def build_shared_routes(
         "matrix_source": matrix_source,
         "warnings": warnings,
         "planning_mode": "full",
+        "same_route_morning_evening": True,
+        "hard_route_limit_minutes": max_route_minutes,
+        "max_morning_minutes": max(morning_times, default=0.0),
+        "max_evening_minutes": max(evening_times, default=0.0),
     }
     return shared_routes, meta
 
@@ -717,10 +908,14 @@ def build_incremental_shared_routes(
     wait_seconds_per_stop: int,
     max_route_minutes: int,
     use_road_network: bool,
-    approved_candidates: list[tuple[float, float, str]],
+    approved_candidates: list[tuple],
     allow_automatic_candidates: bool,
 ):
-    employee_coordinates = list(zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float)))
+    """Mevcut planı günceller; rota grubu geliş/dönüşte aynı kalır."""
+    employee_coordinates = list(
+        zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float))
+    )
+    planning_direction = "morning"
     allocated_routes, duration_matrix, distance_matrix, meta = update_routes_incrementally(
         employee_coordinates=employee_coordinates,
         baseline_routes=baseline_routes,
@@ -730,19 +925,48 @@ def build_incremental_shared_routes(
         target_average_walk_m=target_average_walk_m,
         walking_factor=1.20,
         capacity=capacity,
-        direction=direction,
+        direction=planning_direction,
         wait_seconds_per_stop=wait_seconds_per_stop,
         max_route_minutes=max_route_minutes,
         mode=mode,
         use_road_network=use_road_network,
         allow_automatic_candidates=allow_automatic_candidates,
     )
+
+    allocated_routes = [route for route in allocated_routes if route]
+    morning_times, evening_times = _same_route_directional_times(
+        allocated_routes, duration_matrix, wait_seconds_per_stop
+    )
+    violation = _direction_limit_violation_text(
+        morning_times, evening_times, max_route_minutes
+    )
+    if max_route_minutes and violation:
+        raise ValueError(
+            f"Mevcut plan korunurken {max_route_minutes} dk sınırı iki yönde birden sağlanamadı: "
+            f"{violation}. Bu veri için 'Tam optimizasyon' çalıştırın."
+        )
+
+    output_routes = (
+        reverse_routes_for_return(allocated_routes)
+        if direction == "evening"
+        else allocated_routes
+    )
     shared_routes = materialize_shared_routes(
-        allocated_routes,
+        output_routes,
         duration_matrix,
         distance_matrix,
         direction,
         wait_seconds_per_stop,
+    )
+
+    meta["vehicle_count"] = len(allocated_routes)
+    meta["same_route_morning_evening"] = True
+    meta["hard_route_limit_minutes"] = max_route_minutes
+    meta["max_morning_minutes"] = max(morning_times, default=0.0)
+    meta["max_evening_minutes"] = max(evening_times, default=0.0)
+    meta.setdefault("warnings", []).append(
+        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar "
+        "başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
     )
     return shared_routes, meta
 
@@ -755,6 +979,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
         summary_rows.append(
             {
                 "Rota": f"Rota {route['vehicle_no']}",
+                "Hedef_Fabrika_Saati": route.get("factory_time", ""),
                 "Yolcu": route["occupancy"],
                 "Kapasite": capacity,
                 "Doluluk_Orani": route["occupancy"] / capacity,
@@ -774,6 +999,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                 {
                     "Rota": f"Rota {route['vehicle_no']}",
                     "Durak_Sirasi": order,
+                    "Tahmini_Saat": stop.get("scheduled_time", ""),
                     "Durak_Adi": stop["label"],
                     "Durak_Kaynagi": stop["source"],
                     "Durak_Turu": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
@@ -789,6 +1015,7 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                     {
                         "Rota": f"Rota {route['vehicle_no']}",
                         "Durak_Sirasi": order,
+                        "Tahmini_Saat": stop.get("scheduled_time", ""),
                         "Calisan_ID": row["Calisan_ID"],
                         "Ad_Soyad": row["Ad_Soyad"],
                         "Ev_Adresi": row["Adres"],
@@ -856,8 +1083,9 @@ with st.sidebar:
                 "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Yeni aday seçeneği çalışan evleri ve yakın evlerin orta noktalarını da değerlendirir. "
-                "Bu noktalar saha onayı olmadan kesin durak değildir."
+                "Yeni aday seçeneği çalışan evini durak yapmaz. Önce yüklenen durakları, sonra mevcut "
+                "güzergâh koridorunu kullanır; gerekirse güzergâha yakın yeni yol noktası önerir. "
+                "Yeni noktalar saha onayı olmadan kesin durak değildir."
             ),
         )
 
@@ -886,7 +1114,10 @@ with st.sidebar:
             value=70,
             step=5,
             format="%d dk",
-            help="Sürüş ve durak beklemelerinin toplamıdır. Otomatik mod bu sınır gerekirse araç ekler.",
+            help=(
+                "Sürüş + durak bekleme süresidir. Seçtiğiniz değer sabah ve akşam için "
+                "kontrol edilir; otomatik mod gerekirse servis sayısını artırır."
+            ),
         )
         wait_seconds_per_stop = FIXED_WAIT_SECONDS_PER_STOP
 
@@ -894,9 +1125,13 @@ with st.sidebar:
         direction_label = st.selectbox(
             "Sefer yönü",
             [
-                "Sabah (08.00 varış): çalışan → fabrika",
-                "Akşam (17.30 çıkış): fabrika → çalışan",
+                "Sabah (07.55 varış): çalışan → fabrika",
+                "Akşam (17.40 çıkış): fabrika → çalışan",
             ],
+        )
+        st.info(
+            "🔒 Aynı çalışanlar geliş ve dönüşte aynı servis rotasında kalır. "
+            f"Sistem seçtiğiniz {max_route_minutes} dk sınırını hem sabah hem akşam için kontrol eder."
         )
         use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
         road_consent = False
@@ -913,7 +1148,7 @@ with st.sidebar:
         """
         <div class="sidebar-note">
             <strong>Çalışma düzeni</strong><br>
-            Mesai 08.00–17.30 · Durak bekleme süresi 45 sn ·
+            Sabah hedef fabrika varışı 07.55 · Akşam çıkış 17.40 · Durak bekleme süresi 15 sn ·
             Yakın çalışanlar ortak buluşma noktasında eşleştirilir.
         </div>
         """,
@@ -1017,7 +1252,7 @@ if approved_count:
         f"{candidate_stats.get('approved', 0)} saha onaylı, "
         f"{candidate_stats.get('pending', approved_count)} onay bekliyor. "
         + (
-            "Bunlara ek olarak gerektiğinde otomatik/adres tabanlı adaylar da değerlendirilecek."
+            "Bunlara ek olarak gerektiğinde otomatik güzergâh adayları da değerlendirilecek."
             if allow_automatic_candidates
             else "Bu çalıştırmada bu listenin dışına yeni durak eklenmeyecek."
         )
@@ -1143,8 +1378,9 @@ shared_routes = st.session_state.get("shared_routes")
 if shared_routes is None:
     st.error("Rota sonucu bulunamadı. Optimizasyonu yeniden çalıştırın.")
     st.stop()
-result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
-result_max_route_minutes = st.session_state.get("result_max_route_minutes", 120)
+optimized_vehicle_count = int(result.get("vehicle_count", 0))
+result_wait_seconds = st.session_state.get("result_wait_seconds", 15)
+result_max_route_minutes = st.session_state.get("result_max_route_minutes", 70)
 result_target_average_walk_m = st.session_state.get(
     "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
 )
@@ -1160,13 +1396,24 @@ for warning in result.get("warnings", []):
     elif "maksimum rota süresini aşıyor" in warning:
         st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
 
+if result.get("same_route_morning_evening"):
+    max_morning = float(result.get("max_morning_minutes", 0.0))
+    max_evening = float(result.get("max_evening_minutes", 0.0))
+    hard_limit = int(result.get("hard_route_limit_minutes", result_max_route_minutes))
+    if max(max_morning, max_evening) <= hard_limit + 1e-9:
+        st.success(
+            f"Süre kontrolü tamam: en uzun sabah rotası {max_morning:.0f} dk, "
+            f"en uzun akşam rotası {max_evening:.0f} dk — her ikisi de ≤ {hard_limit} dk."
+        )
+
 nonempty_routes = [route for route in shared_routes if route["occupancy"]]
+# Ekrandaki servis sayısı meta verideki nominal araç sayısı değil, gerçekten kullanılan rota sayısıdır.
 optimized_vehicle_count = len(nonempty_routes)
 result["vehicle_count"] = optimized_vehicle_count
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
 automatic_stop_count = sum(
-    stop.get("source") in {"Otomatik ortak nokta", "Çalışan adresi"}
+    stop.get("source") in {"Otomatik ortak nokta", "Güzergâh üzeri aday durak", "Güzergâha yakın yeni durak"}
     for route in nonempty_routes
     for stop in route["stops"]
 )
@@ -1214,7 +1461,7 @@ with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
         t4.metric("Tekil durak", single_stop_count)
 if automatic_stop_count:
     st.caption(
-        f"{automatic_stop_count} otomatik/adres tabanlı durak önerildi; "
+        f"{automatic_stop_count} otomatik güzergâh durağı önerildi; "
         "kesinleştirilmeden önce saha uygunluğu kontrol edilmelidir."
     )
 if result.get("planning_mode") == "incremental":
@@ -1323,6 +1570,7 @@ st.caption("Rota çizgilerinin ve numaralı durakların ayrıntılarını görme
 st.pydeck_chart(deck, width="stretch")
 
 st.markdown("#### Rota detayları")
+st.caption("Sabah durak saatleri, fabrikaya 07:55 varış hedefinden OSRM segment süreleri ve 15 sn/durak bekleme ile geriye doğru hesaplanır.")
 for route in nonempty_routes:
     route_fill = route["occupancy"] / result_capacity if result_capacity else 0
     st.markdown(
@@ -1339,6 +1587,7 @@ for route in nonempty_routes:
                 <div class="route-stat"><strong>{route['distance_km']:.1f} km</strong><span>Mesafe</span></div>
                 <div class="route-stat"><strong>{route['drive_minutes']:.0f} dk</strong><span>Sürüş</span></div>
                 <div class="route-stat"><strong>{route['total_minutes']:.0f} dk</strong><span>Toplam süre</span></div>
+                <div class="route-stat"><strong>{route.get('factory_time', '')}</strong><span>{'Fabrika varış' if result_direction.startswith('Sabah') else 'Fabrika çıkış'}</span></div>
                 <div class="route-stat"><strong>{route['average_walk_m']:.0f} m</strong><span>Ort. yürüme</span></div>
             </div>
         </div>
@@ -1350,6 +1599,7 @@ for route in nonempty_routes:
         stop_rows.append(
             {
                 "Durak": "Başlangıç",
+                "Tahmini Saat": route.get("factory_time", "17:40"),
                 "Durak Türü": "Fabrika",
                 "Kaynak": "Sabit",
                 "Konum": factory_address,
@@ -1366,6 +1616,7 @@ for route in nonempty_routes:
         stop_rows.append(
             {
                 "Durak": str(order),
+                "Tahmini Saat": stop.get("scheduled_time", ""),
                 "Durak Türü": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
                 "Kaynak": stop["source"],
                 "Konum": stop["label"],
@@ -1378,6 +1629,7 @@ for route in nonempty_routes:
         stop_rows.append(
             {
                 "Durak": "Varış",
+                "Tahmini Saat": route.get("factory_time", "07:55"),
                 "Durak Türü": "Fabrika",
                 "Kaynak": "Sabit",
                 "Konum": factory_address,

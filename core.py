@@ -3,6 +3,12 @@
 OR-Tools ile ortak durak seçimi ve kapasite kısıtlı rota optimizasyonu yapar.
 Yol süreleri için önce OSRM denenir; servis erişilemezse kuş uçuşu mesafe
 tabanlı tahmine otomatik geçilir.
+
+Durak politikası:
+- Yüklenen/mevcut duraklar kesin önceliklidir.
+- Çalışan koordinatları hiçbir zaman servis durağı olarak kullanılmaz.
+- Kapsanamayan tek çalışan için ana rota yönünde bir aday üretilir ve seçilen
+  tekil aday mümkünse OSRM ile en yakın araç yoluna oturtulur.
 """
 
 from __future__ import annotations
@@ -25,6 +31,11 @@ from ortools.sat.python import cp_model
 EARTH_RADIUS_KM = 6371.0088
 ESKISEHIR_CENTER = (39.7767, 30.5206)
 ESKISEHIR_MAX_DISTANCE_KM = 55.0
+MIN_HOME_PICKUP_OFFSET_M = 100.0
+CORRIDOR_WALK_FRACTION = 0.65
+ROUTE_CORRIDOR_SOURCE = "Güzergâh üzeri aday durak"
+ROUTE_DETOUR_SOURCE = "Güzergâha yakın yeni durak"
+MAX_FALLBACK_CORRIDOR_SEGMENT_KM = 4.0
 
 
 @dataclass
@@ -60,7 +71,7 @@ class CommonStop:
     latitude: float | None = None
     longitude: float | None = None
     label: str = ""
-    source: str = "Çalışan adresi"
+    source: str = ROUTE_CORRIDOR_SOURCE
     matrix_index: int | None = None
 
     @property
@@ -98,6 +109,261 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
 
 
+def _interpolate_towards(
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    distance_m: float,
+) -> tuple[float, float]:
+    """Başlangıçtan hedefe doğru yaklaşık ``distance_m`` ilerlenmiş noktayı döndürür."""
+    total_m = haversine_km(origin, destination) * 1000
+    if total_m <= 1e-9 or distance_m <= 0:
+        return float(origin[0]), float(origin[1])
+    ratio = min(1.0, distance_m / total_m)
+    return (
+        float(origin[0] + (destination[0] - origin[0]) * ratio),
+        float(origin[1] + (destination[1] - origin[1]) * ratio),
+    )
+
+
+def _fallback_westbound_anchor(point: tuple[float, float]) -> tuple[float, float]:
+    """Durak listesi yoksa Bozüyük yönündeki ana akışı temsil eden yedek hedef."""
+    return float(point[0]), float(point[1] - 0.025)
+
+
+def _normalize_approved_candidates(
+    approved_candidates: Sequence[tuple] | None,
+) -> list[tuple[float, float, str, str]]:
+    """3 veya 4 alanlı aday durak kayıtlarını tek biçime dönüştürür.
+
+    Dördüncü alan varsa mevcut rota/grup bilgisidir. Bu bilgi, farklı mevcut
+    rotaların son ve ilk duraklarını yanlışlıkla tek bir koridor segmenti gibi
+    birleştirmemek için kullanılır.
+    """
+    records: list[tuple[float, float, str, str]] = []
+    for raw in approved_candidates or []:
+        if len(raw) < 3:
+            continue
+        lat, lon, label = raw[0], raw[1], raw[2]
+        route_group = raw[3] if len(raw) >= 4 else ""
+        try:
+            records.append(
+                (
+                    float(lat),
+                    float(lon),
+                    str(label).strip(),
+                    str(route_group).strip(),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return records
+
+
+def _corridor_segments(
+    approved_records: Sequence[tuple[float, float, str, str]],
+) -> list[tuple[tuple[float, float], tuple[float, float], str]]:
+    """Yüklenmiş durak sırasından mevcut rota koridor segmentlerini üretir."""
+    segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
+    for first, second in zip(approved_records, approved_records[1:]):
+        a = (first[0], first[1])
+        b = (second[0], second[1])
+        first_group = first[3]
+        second_group = second[3]
+        if first_group and second_group and first_group != second_group:
+            continue
+        # Rota/grup bilgisi yoksa çok uzun ardışık sıçramaları koridor sayma.
+        if not first_group and not second_group:
+            if haversine_km(a, b) > MAX_FALLBACK_CORRIDOR_SEGMENT_KM:
+                continue
+        segments.append((a, b, first_group or second_group))
+    return segments
+
+
+def _project_to_segment(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[tuple[float, float], float]:
+    """Noktayı kısa şehir içi segmentine yerel metre düzleminde izdüşürür."""
+    lat0 = math.radians(point[0])
+    meters_per_lat = 111_320.0
+    meters_per_lon = 111_320.0 * max(math.cos(lat0), 1e-6)
+
+    ax = (start[1] - point[1]) * meters_per_lon
+    ay = (start[0] - point[0]) * meters_per_lat
+    bx = (end[1] - point[1]) * meters_per_lon
+    by = (end[0] - point[0]) * meters_per_lat
+    abx = bx - ax
+    aby = by - ay
+    denom = abx * abx + aby * aby
+    if denom <= 1e-9:
+        projection = start
+    else:
+        t = max(0.0, min(1.0, -(ax * abx + ay * aby) / denom))
+        px = ax + t * abx
+        py = ay + t * aby
+        projection = (
+            point[0] + py / meters_per_lat,
+            point[1] + px / meters_per_lon,
+        )
+    distance_m = haversine_km(point, projection) * 1000
+    return (float(projection[0]), float(projection[1])), distance_m
+
+
+def _nearest_corridor_projection(
+    point: tuple[float, float],
+    approved_records: Sequence[tuple[float, float, str, str]],
+) -> tuple[tuple[float, float], float, str] | None:
+    """Mevcut durak koridorundaki en yakın noktayı ve rota grubunu bulur."""
+    best: tuple[tuple[float, float], float, str] | None = None
+    for start, end, group in _corridor_segments(approved_records):
+        projection, distance_m = _project_to_segment(point, start, end)
+        candidate = (projection, distance_m, group)
+        if best is None or distance_m < best[1]:
+            best = candidate
+    if best is not None:
+        return best
+    if approved_records:
+        nearest = min(
+            approved_records,
+            key=lambda record: haversine_km(point, (record[0], record[1])),
+        )
+        nearest_point = (nearest[0], nearest[1])
+        return nearest_point, haversine_km(point, nearest_point) * 1000, nearest[3]
+    return None
+
+
+def _estimated_walk_m(
+    point: tuple[float, float],
+    employee: tuple[float, float],
+    walking_factor: float,
+) -> float:
+    return haversine_km(point, employee) * 1000 * walking_factor
+
+
+def _away_from_employee_homes(
+    point: tuple[float, float],
+    employee_coordinates: Sequence[tuple[float, float]],
+    minimum_offset_m: float,
+) -> bool:
+    """Otomatik noktanın herhangi bir çalışan koordinatına yapışmasını engeller."""
+    return all(
+        haversine_km(point, employee) * 1000 >= minimum_offset_m - 1e-9
+        for employee in employee_coordinates
+    )
+
+
+def _detour_point_towards_corridor(
+    employee: tuple[float, float],
+    corridor_point: tuple[float, float],
+    max_walk_m: float,
+    walking_factor: float,
+) -> tuple[float, float] | None:
+    """Çalışandan mevcut güzergâha doğru, yürüme sınırı içinde yeni aday üretir."""
+    straight_limit_m = max_walk_m / walking_factor
+    total_to_corridor_m = haversine_km(employee, corridor_point) * 1000
+    # Koridor zaten erişilebiliyorsa doğrudan koridor noktası tercih edilir.
+    if total_to_corridor_m <= straight_limit_m + 1e-9:
+        candidate = corridor_point
+    else:
+        # Ev önü alımını engelleyip olabildiğince güzergâha yaklaş.
+        desired_m = min(straight_limit_m * 0.92, total_to_corridor_m)
+        desired_m = max(desired_m, MIN_HOME_PICKUP_OFFSET_M * 1.5)
+        candidate = _interpolate_towards(employee, corridor_point, desired_m)
+    if not _away_from_employee_homes(candidate, (employee,), MIN_HOME_PICKUP_OFFSET_M):
+        return None
+    if _estimated_walk_m(candidate, employee, walking_factor) > max_walk_m + 1e-9:
+        return None
+    return candidate
+
+
+def _corridor_biased_midpoint(
+    first: tuple[float, float],
+    second: tuple[float, float],
+    corridor_point: tuple[float, float],
+    max_walk_m: float,
+    walking_factor: float,
+) -> tuple[float, float] | None:
+    """İki kişilik ortak noktayı en yakın mevcut güzergâha doğru kontrollü kaydırır."""
+    midpoint = ((first[0] + second[0]) / 2, (first[1] + second[1]) / 2)
+    straight_limit_m = max_walk_m / walking_factor
+    for shift_fraction in (0.30, 0.20, 0.12, 0.06, 0.0):
+        candidate = _interpolate_towards(
+            midpoint,
+            corridor_point,
+            straight_limit_m * shift_fraction,
+        )
+        if not _away_from_employee_homes(
+            candidate,
+            (first, second),
+            MIN_HOME_PICKUP_OFFSET_M,
+        ):
+            continue
+        if all(
+            _estimated_walk_m(candidate, employee, walking_factor) <= max_walk_m + 1e-9
+            for employee in (first, second)
+        ):
+            return candidate
+    return None
+
+def snap_to_drivable_road(
+    point: tuple[float, float],
+    timeout: int = 3,
+) -> tuple[tuple[float, float], str] | None:
+    """Aday noktayı OSRM ile en yakın araç yoluna oturtur; erişilemezse ``None`` döner."""
+    lat, lon = map(float, point)
+    url = f"https://router.project-osrm.org/nearest/v1/driving/{lon:.6f},{lat:.6f}?number=1"
+    request = Request(url, headers={"User-Agent": "servis-optimizasyon-web/1.0"})
+    try:
+        with urlopen(request, timeout=max(1, timeout)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("code") != "Ok" or not payload.get("waypoints"):
+            return None
+        waypoint = payload["waypoints"][0]
+        snapped_lon, snapped_lat = waypoint["location"]
+        road_name = str(waypoint.get("name") or "").strip()
+        return (float(snapped_lat), float(snapped_lon)), road_name
+    except Exception:
+        return None
+
+
+def _snap_selected_automatic_stops_to_road(
+    stops: Sequence[CommonStop],
+    employee_coordinates: Sequence[tuple[float, float]],
+    max_walk_m: float,
+    walking_factor: float,
+    minimum_home_offset_m: float,
+) -> None:
+    """Seçilen otomatik adayları OSRM ile en yakın araç yoluna oturtur.
+
+    Yol noktasına oturtma, ilgili çalışanların yürüme sınırını bozuyorsa değişiklik
+    uygulanmaz. Böylece ev koordinatı durak yapılmadan yol üstü aday korunur.
+    """
+    automatic_sources = {ROUTE_CORRIDOR_SOURCE, ROUTE_DETOUR_SOURCE, "Otomatik ortak nokta"}
+    for stop in stops:
+        if stop.source not in automatic_sources:
+            continue
+        snapped = snap_to_drivable_road((float(stop.latitude), float(stop.longitude)))
+        if snapped is None:
+            continue
+        snapped_point, road_name = snapped
+        walks = [
+            _estimated_walk_m(snapped_point, employee_coordinates[index], walking_factor)
+            for index in stop.member_indices
+        ]
+        if any(walk > max_walk_m + 1e-9 for walk in walks):
+            continue
+        if not _away_from_employee_homes(
+            snapped_point,
+            [employee_coordinates[index] for index in stop.member_indices],
+            minimum_home_offset_m,
+        ):
+            continue
+        stop.latitude, stop.longitude = snapped_point
+        stop.walking_distances_m = walks
+        if road_name:
+            stop.label = f"{road_name} güzergâh adayı"
+
 def cluster_common_stops(
     coordinates: Sequence[tuple[float, float]],
     max_walk_m: float = 500.0,
@@ -105,12 +371,11 @@ def cluster_common_stops(
     walking_factor: float = 1.20,
     time_limit_seconds: int = 15,
 ) -> list[CommonStop]:
-    """Ortak durakları tam sayılı set-cover modeliyle seçer.
+    """Ev adreslerini durak yapmadan rota-koridoru ortak noktaları seçer.
 
-    Aday duraklar çalışan koordinatlarıdır. Kuş uçuşu mesafe, şehir içindeki yol
-    sapmalarını ihtiyatlı biçimde temsil etmek için ``walking_factor`` ile
-    büyütülür. Amaç önce durak sayısını, sonra toplam tahmini yürüyüşü azaltır.
-    Böylece önceki açgözlü yöntemin gereksiz durak üretme riski ortadan kalkar.
+    Bu geriye uyumlu yardımcıda yüklenmiş durak listesi bulunmadığı için çalışan
+    noktaları doğrudan durak yapılmaz. Bunun yerine Bozüyük yönündeki servis
+    akışına kaydırılmış adaylar ve uygun ortak noktalar üretilir.
     """
     if max_walk_m < 0:
         raise ValueError("Azami yürüme mesafesi negatif olamaz.")
@@ -119,151 +384,204 @@ def cluster_common_stops(
     if not coordinates:
         return []
 
-    count = len(coordinates)
-    max_stop_load = capacity or count
+    max_stop_load = capacity or len(coordinates)
     if max_stop_load <= 0:
         raise ValueError("Durak kapasitesi sıfırdan büyük olmalıdır.")
-    distances_m = [
-        [
-            haversine_km(coordinates[i], coordinates[j]) * 1000 * walking_factor
-            for j in range(count)
-        ]
-        for i in range(count)
-    ]
 
-    model = cp_model.CpModel()
-    selected = [model.new_bool_var(f"stop_{anchor}") for anchor in range(count)]
-    assignments: dict[tuple[int, int], cp_model.IntVar] = {}
-    by_employee: list[list[cp_model.IntVar]] = [[] for _ in range(count)]
-    by_anchor: list[list[cp_model.IntVar]] = [[] for _ in range(count)]
-
-    for anchor in range(count):
-        for employee in range(count):
-            if distances_m[anchor][employee] <= max_walk_m + 1e-9:
-                variable = model.new_bool_var(f"assign_{anchor}_{employee}")
-                assignments[(anchor, employee)] = variable
-                by_employee[employee].append(variable)
-                by_anchor[anchor].append(variable)
-                model.add(variable <= selected[anchor])
-
-    for employee, variables in enumerate(by_employee):
-        if not variables:
-            raise ValueError(f"{employee + 1}. çalışan için erişilebilir ortak durak bulunamadı.")
-        model.add(sum(variables) == 1)
-
-    for anchor, variables in enumerate(by_anchor):
-        model.add(sum(variables) <= max_stop_load * selected[anchor])
-        model.add(selected[anchor] <= sum(variables))
-
-    # Bir durak eksilmesi, toplam yürüyüşteki olası tüm iyileşmelerden daha değerlidir.
-    stop_priority = int(math.ceil(count * max_walk_m)) + 1
-    walking_cost = sum(
-        int(round(distances_m[anchor][employee])) * variable
-        for (anchor, employee), variable in assignments.items()
+    candidates = generate_candidate_stops(
+        coordinates,
+        max_walk_m=max_walk_m,
+        walking_factor=walking_factor,
+        approved_candidates=None,
+        allow_automatic_candidates=True,
     )
-    model.minimize(stop_priority * sum(selected) + walking_cost)
+    stops, _, _ = optimize_candidate_stops(
+        coordinates,
+        candidates,
+        max_walk_m=max_walk_m,
+        target_average_walk_m=max_walk_m,
+        walking_factor=walking_factor,
+        time_limit_seconds=time_limit_seconds,
+    )
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
-    # Streamlit'in sınırlı Linux konteynerlerinde çok iş parçacıklı CP-SAT bazı
-    # sürümlerde kararsızlaşabildiği için tek iş parçacığı kullanılır.
-    solver.parameters.num_search_workers = 1
-    solver.parameters.random_seed = 42
-    status = solver.solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise ValueError("Ortak durak optimizasyonu için uygulanabilir çözüm bulunamadı.")
+    if not capacity:
+        return stops
 
-    stops: list[CommonStop] = []
-    for anchor in range(count):
-        if not solver.value(selected[anchor]):
-            continue
-        members = sorted(
-            (
-                employee
-                for employee in range(count)
-                if (anchor, employee) in assignments
-                and solver.value(assignments[(anchor, employee)])
-            ),
-            key=lambda employee: (distances_m[anchor][employee], employee),
-        )
-        stops.append(
-            CommonStop(
-                anchor_index=anchor,
-                member_indices=members,
-                walking_distances_m=[distances_m[anchor][employee] for employee in members],
+    capacity_limited: list[CommonStop] = []
+    for stop in stops:
+        pairs = list(zip(stop.member_indices, stop.walking_distances_m))
+        for start in range(0, len(pairs), max_stop_load):
+            chunk = pairs[start : start + max_stop_load]
+            capacity_limited.append(
+                CommonStop(
+                    anchor_index=stop.anchor_index,
+                    member_indices=[pair[0] for pair in chunk],
+                    walking_distances_m=[pair[1] for pair in chunk],
+                    latitude=stop.latitude,
+                    longitude=stop.longitude,
+                    label=stop.label,
+                    source=stop.source,
+                )
             )
-        )
-    return stops
+    return capacity_limited
 
 
 def generate_candidate_stops(
     employee_coordinates: Sequence[tuple[float, float]],
     max_walk_m: float = 500.0,
     walking_factor: float = 1.20,
-    approved_candidates: Sequence[tuple[float, float, str]] | None = None,
+    approved_candidates: Sequence[tuple] | None = None,
     allow_automatic_candidates: bool = True,
+    factory_coordinates: tuple[float, float] | None = None,
 ) -> list[CandidateStop]:
-    """Çalışan adresleri, ortak ara noktalar ve yüklenen noktalardan aday kümesi üretir.
+    """Mevcut durakları ve güzergâh koridorunu esas alarak aday durak üretir.
 
-    İki çalışan arasındaki kuş uçuşu mesafe, ikisinin de azami yürüyüş sınırı
-    içinde kalabileceği kadar kısaysa orta noktaları aday yapılır. Aynı çalışan
-    kümesini kapsayan adaylardan yüklenen olan; yüklenen yoksa toplam yürüyüşü daha
-    kısa olan tutulur. Çalışan adresleri, kapsama garantisi veren yedek adaylardır.
+    Öncelik daima yüklenen/onaylı duraklardadır. Çalışanın ev koordinatı hiçbir
+    koşulda durak adayı yapılmaz. Mevcut durakla kapsanamayan çalışan için önce
+    mevcut güzergâh segmenti üzerinde yürünebilir bir nokta aranır. Bu mümkün
+    değilse çalışan ile en yakın güzergâh arasındaki bağlantıda, evden uzakta ve
+    yürüyüş sınırı içinde kalan minimum sapmalı yeni bir aday üretilir.
     """
     if not employee_coordinates:
         return []
     if walking_factor < 1:
         raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
+    if max_walk_m <= MIN_HOME_PICKUP_OFFSET_M * walking_factor:
+        raise ValueError(
+            "Azami yürüme mesafesi, ev adresinden güvenli uzaklık oluşturmak için yetersiz. "
+            f"En az {MIN_HOME_PICKUP_OFFSET_M * walking_factor:.0f} m seçin."
+        )
 
+    approved_records = _normalize_approved_candidates(approved_candidates)
     raw_candidates: list[CandidateStop] = []
-    if allow_automatic_candidates:
-        for index, (lat, lon) in enumerate(employee_coordinates, start=1):
-            raw_candidates.append(
-                CandidateStop(
-                    float(lat),
-                    float(lon),
-                    f"Adres tabanlı yedek durak {index}",
-                    "Çalışan adresi",
-                )
-            )
-
-    approved_candidates = approved_candidates or []
-    for index, (lat, lon, label) in enumerate(approved_candidates, start=1):
+    for index, (lat, lon, label, _route_group) in enumerate(approved_records, start=1):
         raw_candidates.append(
             CandidateStop(
-                float(lat),
-                float(lon),
-                str(label).strip() or f"Yüklenen aday durak {index}",
+                lat,
+                lon,
+                label or f"Yüklenen aday durak {index}",
                 "Yüklenen aday durak",
             )
         )
 
     if allow_automatic_candidates:
         straight_radius_m = max_walk_m / walking_factor
+        automatic_no = 1
+        detour_no = 1
+
+        for employee in employee_coordinates:
+            employee_point = (float(employee[0]), float(employee[1]))
+            # Mevcut/onaylı bir durak zaten yürünebilir mesafedeyse yeni durak üretme.
+            if any(
+                _estimated_walk_m((record[0], record[1]), employee_point, walking_factor)
+                <= max_walk_m + 1e-9
+                for record in approved_records
+            ):
+                continue
+
+            nearest = _nearest_corridor_projection(employee_point, approved_records)
+            if nearest is not None:
+                corridor_point, corridor_distance_m, route_group = nearest
+            else:
+                route_group = ""
+                corridor_point = (
+                    (float(factory_coordinates[0]), float(factory_coordinates[1]))
+                    if factory_coordinates is not None
+                    else _fallback_westbound_anchor(employee_point)
+                )
+                corridor_distance_m = haversine_km(employee_point, corridor_point) * 1000
+
+            # Güzergâh segmentinin kendisi yürünebiliyorsa durak tam koridor üzerinde olsun.
+            if corridor_distance_m * walking_factor <= max_walk_m + 1e-9:
+                candidate_point = corridor_point
+                if _away_from_employee_homes(
+                    candidate_point,
+                    (employee_point,),
+                    MIN_HOME_PICKUP_OFFSET_M,
+                ):
+                    route_text = f"{route_group} " if route_group else ""
+                    raw_candidates.append(
+                        CandidateStop(
+                            candidate_point[0],
+                            candidate_point[1],
+                            f"{route_text}güzergâh üzeri aday durak {automatic_no}".strip(),
+                            ROUTE_CORRIDOR_SOURCE,
+                        )
+                    )
+                    automatic_no += 1
+                    continue
+
+            # Koridor 1.000 m dışında kalıyorsa ev yerine koridora doğru minimum sapmalı
+            # bir bağlantı noktası açılır. Bu nokta daha sonra seçilirse OSRM ile yola oturtulur.
+            candidate_point = _detour_point_towards_corridor(
+                employee_point,
+                corridor_point,
+                max_walk_m,
+                walking_factor,
+            )
+            if candidate_point is not None:
+                route_text = f"{route_group} " if route_group else ""
+                raw_candidates.append(
+                    CandidateStop(
+                        candidate_point[0],
+                        candidate_point[1],
+                        f"{route_text}güzergâha yakın yeni durak {detour_no}".strip(),
+                        ROUTE_DETOUR_SOURCE,
+                    )
+                )
+                detour_no += 1
+
+        # Yakın iki çalışan için ortak nokta da evlerin ortasında bırakılmaz;
+        # mümkün olduğunca mevcut güzergâha doğru kaydırılır.
         midpoint_no = 1
         for first in range(len(employee_coordinates)):
             for second in range(first + 1, len(employee_coordinates)):
                 if (
                     haversine_km(employee_coordinates[first], employee_coordinates[second]) * 1000
-                    <= 2 * straight_radius_m + 1e-9
+                    > 2 * straight_radius_m + 1e-9
                 ):
-                    lat = (employee_coordinates[first][0] + employee_coordinates[second][0]) / 2
-                    lon = (employee_coordinates[first][1] + employee_coordinates[second][1]) / 2
-                    raw_candidates.append(
-                        CandidateStop(
-                            lat,
-                            lon,
-                            f"Otomatik ortak durak {midpoint_no}",
-                            "Otomatik ortak nokta",
-                        )
+                    continue
+                pair_midpoint = (
+                    (employee_coordinates[first][0] + employee_coordinates[second][0]) / 2,
+                    (employee_coordinates[first][1] + employee_coordinates[second][1]) / 2,
+                )
+                nearest = _nearest_corridor_projection(pair_midpoint, approved_records)
+                if nearest is not None:
+                    corridor_point, _distance_m, route_group = nearest
+                else:
+                    route_group = ""
+                    corridor_point = (
+                        (float(factory_coordinates[0]), float(factory_coordinates[1]))
+                        if factory_coordinates is not None
+                        else _fallback_westbound_anchor(pair_midpoint)
                     )
-                    midpoint_no += 1
+                candidate_point = _corridor_biased_midpoint(
+                    employee_coordinates[first],
+                    employee_coordinates[second],
+                    corridor_point,
+                    max_walk_m,
+                    walking_factor,
+                )
+                if candidate_point is None:
+                    continue
+                route_text = f"{route_group} " if route_group else ""
+                raw_candidates.append(
+                    CandidateStop(
+                        candidate_point[0],
+                        candidate_point[1],
+                        f"{route_text}ortak güzergâh adayı {midpoint_no}".strip(),
+                        "Otomatik ortak nokta",
+                    )
+                )
+                midpoint_no += 1
 
     source_priority = {
         "Yüklenen aday durak": 0,
         "Onaylı durak": 0,
-        "Otomatik ortak nokta": 1,
-        "Çalışan adresi": 2,
+        "Mevcut durak": 0,
+        ROUTE_CORRIDOR_SOURCE: 1,
+        ROUTE_DETOUR_SOURCE: 2,
+        "Otomatik ortak nokta": 2,
     }
     best_by_coverage: dict[tuple[int, ...], tuple[tuple[int, float], CandidateStop]] = {}
     for candidate in raw_candidates:
@@ -271,15 +589,20 @@ def generate_candidate_stops(
             haversine_km((candidate.latitude, candidate.longitude), employee) * 1000 * walking_factor
             for employee in employee_coordinates
         ]
-        coverage = tuple(index for index, distance in enumerate(distances) if distance <= max_walk_m + 1e-9)
+        coverage = tuple(
+            index for index, distance in enumerate(distances)
+            if distance <= max_walk_m + 1e-9
+        )
         if not coverage:
             continue
-        score = (source_priority.get(candidate.source, 9), sum(distances[index] for index in coverage))
+        score = (
+            source_priority.get(candidate.source, 9),
+            sum(distances[index] for index in coverage),
+        )
         if coverage not in best_by_coverage or score < best_by_coverage[coverage][0]:
             best_by_coverage[coverage] = (score, candidate)
 
     return [value[1] for value in best_by_coverage.values()]
-
 
 def optimize_candidate_stops(
     employee_coordinates: Sequence[tuple[float, float]],
@@ -288,6 +611,8 @@ def optimize_candidate_stops(
     target_average_walk_m: float = 300.0,
     walking_factor: float = 1.20,
     time_limit_seconds: int = 8,
+    snap_single_stops_to_road: bool = True,
+    minimum_home_offset_m: float = MIN_HOME_PICKUP_OFFSET_M,
 ) -> tuple[list[CommonStop], int, bool]:
     """Aday durakları set-cover + hedef programlama mantığıyla seçer.
 
@@ -335,10 +660,10 @@ def optimize_candidate_stops(
         )
 
     # Yüklenen/mevcut bir durakla kapsanabilen çalışan, otomatik adaylara
-    # aktarılmaz. Otomatik ve adres tabanlı adaylar yalnızca yüklenen duraklarla
+    # aktarılmaz. Otomatik güzergâh adayları yalnızca yüklenen duraklarla
     # hiç kapsanamayan çalışanlar için devreye girer. Böylece durak türü önceliği
     # sadece aday ayıklamada değil, asıl optimizasyon modelinde de uygulanır.
-    uploaded_sources = {"Yüklenen aday durak", "Onaylı durak"}
+    uploaded_sources = {"Yüklenen aday durak", "Onaylı durak", "Mevcut durak"}
     eligible_by_employee: list[list[int]] = []
     for covering in cover_by_employee:
         uploaded_covering = [
@@ -424,6 +749,14 @@ def optimize_candidate_stops(
                 source=candidate.source,
             )
         )
+    if snap_single_stops_to_road:
+        _snap_selected_automatic_stops_to_road(
+            stops,
+            employee_coordinates,
+            max_walk_m,
+            walking_factor,
+            minimum_home_offset_m,
+        )
     return stops, minimum_stop_count, minimum_proven
 
 
@@ -437,7 +770,7 @@ def update_routes_incrementally(
     walking_factor: float = 1.20,
     capacity: int = 40,
     direction: str = "morning",
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 15,
     max_route_minutes: float = 120.0,
     mode: str = "auto",
     use_road_network: bool = True,
@@ -570,6 +903,7 @@ def update_routes_incrementally(
             walking_factor=walking_factor,
             approved_candidates=approved_candidates,
             allow_automatic_candidates=allow_automatic_candidates,
+            factory_coordinates=factory_coordinates,
         )
         candidate_count = len(candidates)
         relative_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
@@ -700,12 +1034,12 @@ def update_routes_incrementally(
 
     routes = [route for route in routes if route]
     if any(
-        stop.source in {"Otomatik ortak nokta", "Çalışan adresi"}
+        stop.source in {"Otomatik ortak nokta", ROUTE_CORRIDOR_SOURCE, ROUTE_DETOUR_SOURCE}
         for route in routes
         for stop in route
     ):
         warnings.append(
-            "Yeni otomatik/adres tabanlı durak önerisi var; kullanılmadan önce saha güvenliği onaylanmalıdır."
+            "Yeni rota-koridoru/ortak durak önerisi var; kullanılmadan önce saha güvenliği onaylanmalıdır."
         )
 
     meta = {
@@ -1114,17 +1448,6 @@ def _allocate_unsplit_common_stops(
     return routes
 
 
-def reverse_routes_for_return(
-    routes: Sequence[Sequence[CommonStop]],
-) -> list[list[CommonStop]]:
-    """Return the exact same route groups with each route's stop order reversed.
-
-    This is used for the evening return trip so employees stay on the same
-    route/vehicle as in the morning; only the travel direction changes.
-    """
-    return [list(reversed(route)) for route in routes]
-
-
 def assign_common_stops_to_routes(
     stops: Sequence[CommonStop],
     coordinates: Sequence[tuple[float, float]],
@@ -1132,7 +1455,7 @@ def assign_common_stops_to_routes(
     capacity: int,
     duration_matrix: Sequence[Sequence[float]],
     direction: str = "morning",
-    wait_seconds_per_stop: int = 45,
+    wait_seconds_per_stop: int = 15,
     max_route_minutes: float = 0,
     time_limit_seconds: int = 10,
 ) -> list[list[CommonStop]]:

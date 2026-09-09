@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.09-hard-70-dual-direction-active-routes-v2"
+APP_VERSION = "2026.09.09-hard-70-dual-direction-v3"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 45
 
@@ -738,7 +738,9 @@ def build_shared_routes(
                 planning_direction,
                 wait_seconds_per_stop=wait_seconds_per_stop,
                 max_route_minutes=max_route_minutes,
-                time_limit_seconds=15,
+                time_limit_seconds=30,
+                require_all_vehicles=True,
+                enforce_reverse_time_limit=True,
             )
 
             # Boş araçlar servis değildir. Bunları hemen çıkarıp gerçek rota sayısını kullanıyoruz.
@@ -755,8 +757,8 @@ def build_shared_routes(
                 morning_times, evening_times, max_route_minutes
             )
 
-            # OR-Tools sabah sınırını model içinde uygular. Burada ayrıca aynı rota grubunun
-            # ters akşam seferini de kontrol ediyoruz. Böylece 70 dk iki yön için de gerçek sınırdır.
+            # OR-Tools artık sabah ve ters akşam sürelerini aynı model içinde hard kısıt olarak
+            # uygular. Bu ikinci kontrol yalnızca sonuç doğrulamasıdır.
             if max_route_minutes and last_direction_violation:
                 if mode == "fixed":
                     raise ValueError(
@@ -778,9 +780,9 @@ def build_shared_routes(
     else:
         detail = f" Son kontrol: {last_direction_violation}." if last_direction_violation else ""
         raise ValueError(
-            f"Kapasite ve {max_route_minutes} dk sabah/akşam rota süresi sınırlarını "
-            f"birlikte sağlayan çözüm bulunamadı.{detail} "
-            "Araç kapasitesini veya durak yapısını kontrol edin."
+            f"{max_route_minutes} dk sabah/akşam sınırı için denenen araç sayılarında "
+            f"uygulanabilir çözüm bulunamadı.{detail} "
+            "Bu, yalnızca kapasite değil; durakların coğrafi dağılımı ve yol süreleriyle de ilgili olabilir."
         ) from last_error
 
     # Nihai süreleri aktif sabah rota grupları üzerinden sakla.

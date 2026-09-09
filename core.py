@@ -773,6 +773,7 @@ def update_routes_incrementally(
     wait_seconds_per_stop: int = 15,
     max_route_minutes: float = 120.0,
     mode: str = "auto",
+    fixed_vehicle_count: int | None = None,
     use_road_network: bool = True,
     allow_automatic_candidates: bool = True,
 ) -> tuple[list[list[CommonStop]], list[list[float]], list[list[float]], dict]:
@@ -847,6 +848,20 @@ def update_routes_incrementally(
                 )
         routes.append(route)
 
+    if mode == "fixed":
+        target_vehicle_count = int(fixed_vehicle_count or len(routes) or 3)
+        if target_vehicle_count <= 0:
+            raise ValueError("Sabit servis sayısı en az 1 olmalıdır.")
+        if len(routes) > target_vehicle_count:
+            raise ValueError(
+                f"Önceki planda {len(routes)} aktif rota var; Sabit {target_vehicle_count} servis "
+                "seçimi mevcut planı koruma modunda rota azaltamaz. Tam optimizasyon çalıştırın."
+            )
+        while len(routes) < target_vehicle_count:
+            routes.append([])
+    else:
+        target_vehicle_count = None
+
     preserved_employee_count = len(assigned_employees)
     preserved_baseline_stop_count = sum(len(route) for route in routes)
     initially_unassigned = [
@@ -871,9 +886,12 @@ def update_routes_incrementally(
                     placements.append((distance, route_index, stop_index))
         if not placements:
             continue
+        # Birden fazla erişilebilir durak varsa önce daha az dolu servisi seç,
+        # aynı dolulukta daha kısa yürümeyi tercih et. Böylece mevcut plan
+        # korunurken yeni/adresi değişen çalışanlar araçlara dengeli eklenir.
         distance, route_index, stop_index = min(
             placements,
-            key=lambda item: (item[0], route_loads[item[1]], item[1], item[2]),
+            key=lambda item: (route_loads[item[1]], item[0], item[1], item[2]),
         )
         stop = routes[route_index][stop_index]
         stop.member_indices.append(employee_index)
@@ -961,12 +979,20 @@ def update_routes_incrementally(
     for new_stop in sorted(new_stops, key=lambda stop: (-stop.passenger_count, stop.label)):
         pending_pairs = list(zip(new_stop.member_indices, new_stop.walking_distances_m))
         while pending_pairs:
-            placements: list[tuple[int, float, int, int, int | None]] = []
+            # Mevcut rota sayısına göre kişi başı hedef yükü dinamik hesapla.
+            # Yeni bir rota açılırsa hedef sonraki turda otomatik yeniden hesaplanır.
+            balanced_target = math.ceil(len(employee_coordinates) / max(1, len(routes)))
+            placements: list[tuple[int, float, int, int, int, int | None]] = []
             for route_index, route in enumerate(routes):
                 available = capacity - route_loads[route_index]
                 if available <= 0:
                     continue
-                take = min(available, len(pending_pairs))
+                # Düşük dolu rotayı hedefe kadar doldur; tüm rotalar hedefteyse
+                # ilerleyebilmek için en az bir yolcu almaya izin ver.
+                desired_take = max(1, balanced_target - route_loads[route_index])
+                take = min(available, len(pending_pairs), desired_take)
+                projected_load = route_loads[route_index] + take
+                balance_error = abs(projected_load - balanced_target)
                 same_stop_index = next(
                     (
                         index
@@ -976,7 +1002,9 @@ def update_routes_incrementally(
                     None,
                 )
                 if same_stop_index is not None:
-                    placements.append((take, 0.0, route_loads[route_index], route_index, same_stop_index))
+                    placements.append(
+                        (balance_error, 0.0, projected_load, take, route_index, same_stop_index)
+                    )
                     continue
                 old_total = route_total_seconds(route)
                 best_delta = math.inf
@@ -989,12 +1017,15 @@ def update_routes_incrementally(
                         best_position = position
                 if math.isfinite(best_delta):
                     # position bilgisi negatif olmayan bir indeks olarak son alanda taşınır.
-                    placements.append((take, best_delta, route_loads[route_index], route_index, -best_position - 1))
+                    placements.append(
+                        (balance_error, best_delta, projected_load, take, route_index, -best_position - 1)
+                    )
 
             if not placements:
                 if mode == "fixed":
                     raise ValueError(
-                        "Yeni çalışan mevcut 3 rotaya kapasite/süre sınırları içinde eklenemedi. "
+                        f"Yeni çalışan mevcut {target_vehicle_count or len(routes)} rotaya "
+                        "kapasite/süre sınırları içinde eklenemedi. "
                         "Otomatik rota sayısını seçin veya tam optimizasyon çalıştırın."
                     )
                 single_route_total = route_total_seconds([new_stop])
@@ -1007,9 +1038,11 @@ def update_routes_incrementally(
                 added_route_count += 1
                 continue
 
-            take, _, _, route_index, placement_code = min(
+            _, _, _, take, route_index, placement_code = min(
                 placements,
-                key=lambda item: (-item[0], item[1], item[2], item[3]),
+                # Önce hedef doluluğa en yakın dağılım, sonra en az ek rota
+                # süresi ve daha düşük nihai yük tercih edilir.
+                key=lambda item: (item[0], item[1], item[2], item[4]),
             )
             selected_pairs = pending_pairs[:take]
             pending_pairs = pending_pairs[take:]
@@ -1057,6 +1090,11 @@ def update_routes_incrementally(
         "new_stop_count": len(new_stops),
         "removed_stop_count": max(0, baseline_stop_count - preserved_baseline_stop_count),
         "added_route_count": added_route_count,
+        "route_loads": [sum(stop.passenger_count for stop in route) for route in routes],
+        "load_spread": (
+            max((sum(stop.passenger_count for stop in route) for route in routes), default=0)
+            - min((sum(stop.passenger_count for stop in route) for route in routes), default=0)
+        ),
     }
     return routes, duration_matrix, distance_matrix, meta
 
@@ -1533,6 +1571,25 @@ def assign_common_stops_to_routes(
         True,
         "Capacity",
     )
+
+    # Yolcu sayısını araçlar arasında mümkün olduğunca eşit dağıt.
+    # Örn. 92 çalışan / 4 araç için hedef 23-23-23-23; 109 / 4 için
+    # 27-27-27-28 bandıdır. Ortak duraklar bölünmez olduğu için bu hedef
+    # kesin bir kısıt değil, yüksek öncelikli yumuşak bir hedeftir. Böylece
+    # coğrafi olarak mantıksız bir rota üretmeden doluluk farkı minimize edilir.
+    capacity_dimension = routing.GetDimensionOrDie("Capacity")
+    balanced_base, balanced_extra = divmod(employee_count, vehicle_count)
+    balanced_low = balanced_base
+    balanced_high = balanced_base + (1 if balanced_extra else 0)
+    balance_penalty = 1200  # hedef dışındaki her yolcu için güçlü ceza (maliyet birimi: saniye)
+    for vehicle_no in range(vehicle_count):
+        end_index = routing.End(vehicle_no)
+        capacity_dimension.SetCumulVarSoftLowerBound(
+            end_index, balanced_low, balance_penalty
+        )
+        capacity_dimension.SetCumulVarSoftUpperBound(
+            end_index, balanced_high, balance_penalty
+        )
 
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
     routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")

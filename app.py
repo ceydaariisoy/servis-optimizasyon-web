@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.09-route-corridor-0755-schedule-v1"
+APP_VERSION = "2026.09.09-route-corridor-fixed-4-service-v3"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -732,6 +732,7 @@ def build_shared_routes(
     direction: str,
     capacity: int,
     mode: str,
+    fixed_vehicle_count: int,
     wait_seconds_per_stop: int,
     max_route_minutes: int,
     use_road_network: bool,
@@ -779,10 +780,10 @@ def build_shared_routes(
     )
 
     minimum_vehicle_count = math.ceil(len(employees) / capacity)
-    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
+    vehicle_count = int(fixed_vehicle_count) if mode == "fixed" else minimum_vehicle_count
     if vehicle_count < minimum_vehicle_count:
         raise ValueError(
-            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
+            f"{vehicle_count} araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
         )
 
     # Aynı servis grubu geliş/dönüşte korunduğu için dağılım HER ZAMAN sabah yönünde çözülür.
@@ -827,7 +828,7 @@ def build_shared_routes(
             if max_route_minutes and last_direction_violation:
                 if mode == "fixed":
                     raise ValueError(
-                        f"Sabit 3 servis ile {max_route_minutes} dk sınırı her iki yönde sağlanamıyor. "
+                        f"Sabit {fixed_vehicle_count} servis ile {max_route_minutes} dk sınırı her iki yönde sağlanamıyor. "
                         f"{last_direction_violation}. Rota sayısını Otomatik seçin."
                     )
                 vehicle_count += 1
@@ -885,6 +886,11 @@ def build_shared_routes(
         "minimum_stop_count": minimum_stop_count,
         "minimum_proven": minimum_proven,
         "selected_stop_count": len(all_stops),
+        "route_loads": [sum(stop.passenger_count for stop in route) for route in allocated_routes],
+        "load_spread": (
+            max((sum(stop.passenger_count for stop in route) for route in allocated_routes), default=0)
+            - min((sum(stop.passenger_count for stop in route) for route in allocated_routes), default=0)
+        ),
         "matrix_source": matrix_source,
         "warnings": warnings,
         "planning_mode": "full",
@@ -905,6 +911,7 @@ def build_incremental_shared_routes(
     direction: str,
     capacity: int,
     mode: str,
+    fixed_vehicle_count: int,
     wait_seconds_per_stop: int,
     max_route_minutes: int,
     use_road_network: bool,
@@ -929,6 +936,7 @@ def build_incremental_shared_routes(
         wait_seconds_per_stop=wait_seconds_per_stop,
         max_route_minutes=max_route_minutes,
         mode=mode,
+        fixed_vehicle_count=fixed_vehicle_count,
         use_road_network=use_road_network,
         allow_automatic_candidates=allow_automatic_candidates,
     )
@@ -1074,7 +1082,11 @@ with st.sidebar:
         )
         mode_label = st.selectbox(
             "Rota sayısı",
-            ["Otomatik (kapasite + süreye göre)", "Sabit 3 servis"],
+            [
+                "Otomatik (kapasite + süreye göre)",
+                "Sabit 3 servis",
+                "Sabit 4 servis",
+            ],
         )
         stop_policy_label = st.selectbox(
             "Durak politikası",
@@ -1149,7 +1161,7 @@ with st.sidebar:
         <div class="sidebar-note">
             <strong>Çalışma düzeni</strong><br>
             Sabah hedef fabrika varışı 07.55 · Akşam çıkış 17.40 · Durak bekleme süresi 15 sn ·
-            Yakın çalışanlar ortak buluşma noktasında eşleştirilir.
+            Araçlardaki yolcu sayısı rota ve kapasite kısıtları içinde mümkün olduğunca dengeli dağıtılır.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1319,6 +1331,8 @@ if st.button(
     with st.spinner("Ortak duraklar seçiliyor ve rotalar birlikte optimize ediliyor..."):
         try:
             mode = "fixed" if mode_label.startswith("Sabit") else "auto"
+            fixed_match = re.search(r"\d+", mode_label)
+            fixed_vehicle_count = int(fixed_match.group()) if fixed_match else 3
             direction = "morning" if direction_label.startswith("Sabah") else "evening"
             common_arguments = {
                 "employees": employees,
@@ -1328,6 +1342,7 @@ if st.button(
                 "direction": direction,
                 "capacity": int(capacity),
                 "mode": mode,
+                "fixed_vehicle_count": fixed_vehicle_count,
                 "wait_seconds_per_stop": int(wait_seconds_per_stop),
                 "max_route_minutes": int(max_route_minutes),
                 "use_road_network": bool(use_road_network),
@@ -1411,6 +1426,8 @@ nonempty_routes = [route for route in shared_routes if route["occupancy"]]
 optimized_vehicle_count = len(nonempty_routes)
 result["vehicle_count"] = optimized_vehicle_count
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
+route_loads = [int(route["occupancy"]) for route in nonempty_routes]
+load_spread = max(route_loads, default=0) - min(route_loads, default=0)
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
 automatic_stop_count = sum(
     stop.get("source") in {"Otomatik ortak nokta", "Güzergâh üzeri aday durak", "Güzergâha yakın yeni durak"}
@@ -1443,6 +1460,13 @@ s1.metric("Ortalama yürüme", f"{average_walk:.0f} m")
 s2.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
 s3.metric("Toplam rota mesafesi", f"{total_distance:.1f} km")
 s4.metric("En uzun rota", f"{longest_route:.0f} dk")
+if len(route_loads) > 1:
+    st.caption(
+        "Yolcu dağılımı: "
+        + " · ".join(f"Rota {i + 1}: {load} kişi" for i, load in enumerate(route_loads))
+        + f" · En yüksek–en düşük fark: {load_spread} kişi. "
+        "Optimizasyon, rota süresi ve coğrafi uygunlukla birlikte bu farkı mümkün olduğunca küçültür."
+    )
 
 with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
     t1, t2, t3, t4 = st.columns(4)

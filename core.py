@@ -886,12 +886,12 @@ def update_routes_incrementally(
                     placements.append((distance, route_index, stop_index))
         if not placements:
             continue
-        # Birden fazla erişilebilir durak varsa önce daha az dolu servisi seç,
-        # aynı dolulukta daha kısa yürümeyi tercih et. Böylece mevcut plan
-        # korunurken yeni/adresi değişen çalışanlar araçlara dengeli eklenir.
+        # Birden fazla erişilebilir mevcut durak varsa en kısa yürümeyi tercih et.
+        # Araç doluluğu yalnızca kapasite üst sınırı olarak kontrol edilir;
+        # servisler arasında eşit yolcu dağılımı hedeflenmez.
         distance, route_index, stop_index = min(
             placements,
-            key=lambda item: (route_loads[item[1]], item[0], item[1], item[2]),
+            key=lambda item: (item[0], item[1], item[2]),
         )
         stop = routes[route_index][stop_index]
         stop.member_indices.append(employee_index)
@@ -979,20 +979,17 @@ def update_routes_incrementally(
     for new_stop in sorted(new_stops, key=lambda stop: (-stop.passenger_count, stop.label)):
         pending_pairs = list(zip(new_stop.member_indices, new_stop.walking_distances_m))
         while pending_pairs:
-            # Mevcut rota sayısına göre kişi başı hedef yükü dinamik hesapla.
-            # Yeni bir rota açılırsa hedef sonraki turda otomatik yeniden hesaplanır.
-            balanced_target = math.ceil(len(employee_coordinates) / max(1, len(routes)))
+            # Araç kapasitesi yalnızca üst sınırdır; rotalar eşit doluluğa zorlanmaz.
+            # Öncelik aynı fiziksel durağı yeniden kullanmak ve yeni durak gerekiyorsa
+            # rotaya en az ek süre getiren servisi seçmektir.
             placements: list[tuple[int, float, int, int, int, int | None]] = []
             for route_index, route in enumerate(routes):
                 available = capacity - route_loads[route_index]
                 if available <= 0:
                     continue
-                # Düşük dolu rotayı hedefe kadar doldur; tüm rotalar hedefteyse
-                # ilerleyebilmek için en az bir yolcu almaya izin ver.
-                desired_take = max(1, balanced_target - route_loads[route_index])
-                take = min(available, len(pending_pairs), desired_take)
-                projected_load = route_loads[route_index] + take
-                balance_error = abs(projected_load - balanced_target)
+
+                # Uygun rota, mevcut kapasitesi elverdiği ölçüde bu grubu alabilir.
+                take = min(available, len(pending_pairs))
                 same_stop_index = next(
                     (
                         index
@@ -1003,9 +1000,10 @@ def update_routes_incrementally(
                 )
                 if same_stop_index is not None:
                     placements.append(
-                        (balance_error, 0.0, projected_load, take, route_index, same_stop_index)
+                        (0, 0.0, -take, take, route_index, same_stop_index)
                     )
                     continue
+
                 old_total = route_total_seconds(route)
                 best_delta = math.inf
                 best_position = 0
@@ -1016,9 +1014,11 @@ def update_routes_incrementally(
                         best_delta = new_total - old_total
                         best_position = position
                 if math.isfinite(best_delta):
-                    # position bilgisi negatif olmayan bir indeks olarak son alanda taşınır.
+                    # İlk alan mevcut durağı kullanma önceliğidir (0=mevcut, 1=yeni).
+                    # Üçüncü alanda -take kullanılarak aynı rota uygunsa grubu mümkün
+                    # olduğunca bölmeden taşımak tercih edilir.
                     placements.append(
-                        (balance_error, best_delta, projected_load, take, route_index, -best_position - 1)
+                        (1, best_delta, -take, take, route_index, -best_position - 1)
                     )
 
             if not placements:
@@ -1040,8 +1040,8 @@ def update_routes_incrementally(
 
             _, _, _, take, route_index, placement_code = min(
                 placements,
-                # Önce hedef doluluğa en yakın dağılım, sonra en az ek rota
-                # süresi ve daha düşük nihai yük tercih edilir.
+                # Önce mevcut fiziksel durağı kullan, sonra en az ek rota süresini
+                # ve mümkünse daha fazla yolcuyu aynı rota üzerinde tutmayı tercih et.
                 key=lambda item: (item[0], item[1], item[2], item[4]),
             )
             selected_pairs = pending_pairs[:take]
@@ -1572,23 +1572,17 @@ def assign_common_stops_to_routes(
         "Capacity",
     )
 
-    # Yolcu sayısını araçlar arasında mümkün olduğunca eşit dağıt.
-    # Örn. 92 çalışan / 4 araç için hedef 23-23-23-23; 109 / 4 için
-    # 27-27-27-28 bandıdır. Ortak duraklar bölünmez olduğu için bu hedef
-    # kesin bir kısıt değil, yüksek öncelikli yumuşak bir hedeftir. Böylece
-    # coğrafi olarak mantıksız bir rota üretmeden doluluk farkı minimize edilir.
-    capacity_dimension = routing.GetDimensionOrDie("Capacity")
-    balanced_base, balanced_extra = divmod(employee_count, vehicle_count)
-    balanced_low = balanced_base
-    balanced_high = balanced_base + (1 if balanced_extra else 0)
-    balance_penalty = 1200  # hedef dışındaki her yolcu için güçlü ceza (maliyet birimi: saniye)
-    for vehicle_no in range(vehicle_count):
-        end_index = routing.End(vehicle_no)
-        capacity_dimension.SetCumulVarSoftLowerBound(
-            end_index, balanced_low, balance_penalty
+    # Kapasite yalnızca üst sınırdır. Araçlardaki yolcu sayıları eşitlenmez.
+    # Sabit rota sayısı seçildiyse her seçilen servis en az bir ortak durağa
+    # hizmet eder; doluluklar coğrafi yapı ve rota maliyetine göre farklı olabilir.
+    if vehicle_count > len(stops):
+        raise ValueError(
+            f"{vehicle_count} aktif servis için yeterli sayıda ortak durak bulunmuyor. "
+            f"Mevcut ortak durak sayısı: {len(stops)}."
         )
-        capacity_dimension.SetCumulVarSoftUpperBound(
-            end_index, balanced_high, balance_penalty
+    for vehicle_no in range(vehicle_count):
+        routing.solver().Add(
+            routing.NextVar(routing.Start(vehicle_no)) != routing.End(vehicle_no)
         )
 
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60

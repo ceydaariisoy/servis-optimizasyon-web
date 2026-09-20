@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.09-route-corridor-fixed-4-service-v3"
+APP_VERSION = "2026.09.20-flexible-route-load-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -1161,7 +1161,7 @@ with st.sidebar:
         <div class="sidebar-note">
             <strong>Çalışma düzeni</strong><br>
             Sabah hedef fabrika varışı 07.55 · Akşam çıkış 17.40 · Durak bekleme süresi 15 sn ·
-            Araçlardaki yolcu sayısı rota ve kapasite kısıtları içinde mümkün olduğunca dengeli dağıtılır.
+            Araç kapasitesi üst sınır olarak uygulanır; rota dolulukları eşitlenmez ve ihtiyaca göre farklı araç boyutları kullanılabilir.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1465,7 +1465,7 @@ if len(route_loads) > 1:
         "Yolcu dağılımı: "
         + " · ".join(f"Rota {i + 1}: {load} kişi" for i, load in enumerate(route_loads))
         + f" · En yüksek–en düşük fark: {load_spread} kişi. "
-        "Optimizasyon, rota süresi ve coğrafi uygunlukla birlikte bu farkı mümkün olduğunca küçültür."
+        "Araç kapasitesi üst sınırdır; rota doluluklarının birbirine eşit olması hedeflenmez."
     )
 
 with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):

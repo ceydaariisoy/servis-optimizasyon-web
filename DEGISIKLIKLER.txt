@@ -1,0 +1,25 @@
+SERVIS ROTA OPTIMIZASYONU - ESNEK DOLULUK SURUMU
+Tarih: 20.09.2026
+
+Yapilan temel degisiklikler:
+- Servisler arasinda esit kisi dagilimi hedefi kaldirildi.
+- 45 kisi, her arac icin yalnizca maksimum kapasite siniri olarak kullaniliyor.
+- Sabit 4 rota secildiginde 4 aktif rota korunuyor; rotalar esit doluluga zorlanmiyor.
+- Yeni/adresi degisen calisanlarda daha az dolu servisi secme onceligi kaldirildi.
+- Mevcut duraga eklemede en kisa yurume mesafesi oncelikli.
+- Yeni durak eklemede mevcut duragi tekrar kullanma ve en az ek rota suresi oncelikli.
+- Arayuzdeki "dengeli yolcu dagilimi" aciklamalari guncellendi.
+
+Ornek:
+4 rota sonucunda 40 / 36 / 25 / 18 gibi bir dagilim normaldir.
+Operasyonda yogun iki rota icin buyuk, daha dusuk doluluklu iki rota icin
+daha kucuk servis planlanabilir.
+
+Calistirma:
+1) Bu klasoru bilgisayariniza indirin.
+2) Windows'ta CALISTIR.bat dosyasina cift tiklayin.
+3) Ilk acilista gerekli Python paketleri otomatik kurulur.
+4) Ardindan Streamlit arayuzu tarayicida acilir.
+
+Not:
+Python 3.11 veya 3.12 onerilir.

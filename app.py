@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.21-reference-3-route-v1"
+APP_VERSION = "2026.09.21-3route-balanced-reference-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -565,7 +565,7 @@ def _route_stop_schedule_seconds(
     direction: str,
     wait_seconds_per_stop: int,
 ) -> tuple[list[float], float]:
-    """Durak saatlerini 07:55 fabrika varışı / 17:30 fabrika çıkışına göre hesaplar."""
+    """Durak saatlerini 07:55 fabrika varışı / 17:40 fabrika çıkışına göre hesaplar."""
     if not ordered_matrix_indices:
         anchor = (
             MORNING_FACTORY_ARRIVAL_SECONDS
@@ -1149,7 +1149,7 @@ with st.sidebar:
         """
         <div class="sidebar-note">
             <strong>Çalışma düzeni</strong><br>
-            Sabah hedef fabrika varışı 07.55 · Akşam çıkış 17.30 · Durak bekleme süresi 45 sn ·
+            Sabah hedef fabrika varışı 07.55 · Akşam çıkış 17.40 · Durak bekleme süresi 15 sn ·
             Yakın çalışanlar ortak buluşma noktasında eşleştirilir.
         </div>
         """,
@@ -1380,7 +1380,7 @@ if shared_routes is None:
     st.error("Rota sonucu bulunamadı. Optimizasyonu yeniden çalıştırın.")
     st.stop()
 optimized_vehicle_count = int(result.get("vehicle_count", 0))
-result_wait_seconds = st.session_state.get("result_wait_seconds", 45)
+result_wait_seconds = st.session_state.get("result_wait_seconds", 15)
 result_max_route_minutes = st.session_state.get("result_max_route_minutes", 70)
 result_target_average_walk_m = st.session_state.get(
     "result_target_average_walk_m", FIXED_TARGET_AVERAGE_WALK_M
@@ -1571,7 +1571,7 @@ st.caption("Rota çizgilerinin ve numaralı durakların ayrıntılarını görme
 st.pydeck_chart(deck, width="stretch")
 
 st.markdown("#### Rota detayları")
-st.caption("Sabah durak saatleri, fabrikaya 07:55 varış hedefinden OSRM segment süreleri ve 45 sn/durak bekleme ile geriye doğru hesaplanır.")
+st.caption("Sabah durak saatleri, fabrikaya 07:55 varış hedefinden OSRM segment süreleri ve 15 sn/durak bekleme ile geriye doğru hesaplanır.")
 for route in nonempty_routes:
     route_fill = route["occupancy"] / result_capacity if result_capacity else 0
     st.markdown(
@@ -1600,7 +1600,7 @@ for route in nonempty_routes:
         stop_rows.append(
             {
                 "Durak": "Başlangıç",
-                "Tahmini Saat": route.get("factory_time", "17:30"),
+                "Tahmini Saat": route.get("factory_time", "17:40"),
                 "Durak Türü": "Fabrika",
                 "Kaynak": "Sabit",
                 "Konum": factory_address,

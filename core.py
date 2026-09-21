@@ -1534,6 +1534,30 @@ def assign_common_stops_to_routes(
         "Capacity",
     )
 
+    # Araç doluluklarını dengeli tut.
+    # Örn. 92 çalışan / 3 servis için hedef yaklaşık 31-31-30 kişidir.
+    # Bu bölüm 43-33-16 gibi aşırı dengesiz dağılımları güçlü biçimde cezalandırır.
+    capacity_dimension = routing.GetDimensionOrDie("Capacity")
+    balanced_base, balanced_extra = divmod(employee_count, vehicle_count)
+    balanced_low = balanced_base
+    balanced_high = balanced_base + (1 if balanced_extra else 0)
+
+    # Her servis mümkünse en az %55 dolu olsun.
+    minimum_reasonable_load = min(
+        balanced_low,
+        max(1, int(math.ceil(capacity * 0.55))),
+    )
+
+    balance_penalty = 5000
+    for vehicle_no in range(vehicle_count):
+        end_index = routing.End(vehicle_no)
+        capacity_dimension.SetCumulVarSoftLowerBound(
+            end_index, minimum_reasonable_load, balance_penalty
+        )
+        capacity_dimension.SetCumulVarSoftUpperBound(
+            end_index, balanced_high, balance_penalty
+        )
+
     horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
     routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")
     time_dimension = routing.GetDimensionOrDie("Time")

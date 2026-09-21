@@ -109,6 +109,215 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
 
 
+# ---------------------------------------------------------------------------
+# Görselde onaylanan 3 servislik referans dağılım
+# ---------------------------------------------------------------------------
+
+REFERENCE_ROUTE_TEMPLATE = (
+    (
+        ("Adres tabanlı yedek durak 50", "home", ("40374",), ("40374",)),
+        ("Otomatik ortak durak 87", "midpoint", ("60882", "60083"), ("60083", "43536")),
+        ("ÇOŞTU SOKAK PALMİYE SİT. KARŞISI", "catalog", ("55665", "53656", "18253", "43536"), ()),
+        ("GÜNDÜZ ÖKÇÜN BULVARI ENTEPE KONUTLARI", "catalog", ("44550", "3823", "41031"), ()),
+        ("Adres tabanlı yedek durak 86", "home", ("61041",), ("61041",)),
+        ("AÖF ÖNÜ", "catalog", ("60706", "51071"), ()),
+        ("BÖREKÇİ (AYTAÇ CADDESİ)", "catalog", ("59124", "47969", "44327", "46865", "44549"), ()),
+        ("BAHÇELİEVLER MUHTARLIK (AYTAÇ CADDESİ)", "catalog", ("59545", "48214", "47712", "47865"), ()),
+        ("KANAL 26 ATM ÖNÜ", "catalog", ("61081", "13672", "52699"), ()),
+    ),
+    (
+        ("Otomatik ortak durak 802", "midpoint", ("61038", "49780"), ("49780", "61038")),
+        ("Adres tabanlı yedek durak 77", "home", ("55841",), ("55841",)),
+        ("MİLLİ EĞİTİM", "catalog", ("31276", "54778", "52375", "60890"), ()),
+        ("DEDEMAN OTEL", "catalog", ("43696", "56438", "54732"), ()),
+        ("ATATÜRK BULVARI BİM (AKARBAŞI TARAFI)", "catalog", ("60848", "59194"), ()),
+        ("ÖĞRETMEN EVİ", "catalog", ("43713", "57647", "26066", "37457"), ()),
+        ("SAMİ RAMAZANOĞLU CAMİ", "catalog", ("19297", "26944"), ()),
+        ("ALİ FUAT GÜVEN CAD. BEYAZIT CAMİ", "catalog", ("45768", "51971", "50131"), ()),
+        ("ALİ FUAT GÜVEN CADDESİ ERCAN SOKAK BAŞI", "catalog", ("11221", "28222", "3103"), ()),
+        ("T.M.O ÖNÜ", "catalog", ("27901", "53900", "29835"), ()),
+        ("BİRLİK CADDESİ İNCİ BÖREK", "catalog", ("26594", "15450", "54276"), ()),
+        ("UZUNLAR SK.", "catalog", ("33182", "44264", "52532", "6696"), ()),
+        ("GÜNDÜZ ÖKÇÜN BULVARI FATİH CAMİ", "catalog", ("11508", "58161", "46547"), ()),
+    ),
+    (
+        ("TOTAL PETROL", "catalog", ("43689",), ()),
+        ("Adres tabanlı yedek durak 10", "home", ("39011",), ("39011",)),
+        ("Adres tabanlı yedek durak 83", "home", ("60873",), ("60873",)),
+        ("Adres tabanlı yedek durak 52", "home", ("38932",), ("38932",)),
+        ("ALANÖNÜ NUR TAKSİ", "catalog", ("40435", "48495", "47557", "44546"), ()),
+        ("ZİYAPAŞA CAD. MİNİ TAKSİ", "catalog", ("47781",), ()),
+        ("HAT BOYU A101 ÖNÜ", "catalog", ("40002", "45778"), ()),
+        ("SAKARYA CAD. SAAT KULESİ KARAKOL", "catalog", ("48394", "50870", "52361", "41553"), ()),
+        ("ATATÜRK CADDESİ MODA TAKSİ", "catalog", ("57617", "28081", "30132"), ()),
+        ("TEPEBAŞI IŞIKLAR PETEK PASTANESİ", "catalog", ("32142", "44284", "56418", "20974"), ()),
+        ("TEPEBAŞI LUKOİL PETROL", "catalog", ("52488", "41134", "44182", "46895", "52004", "3208", "54457", "19980"), ()),
+    ),
+)
+
+
+def _reference_employee_key(value: object) -> str:
+    """Excel'deki 123 / 123.0 / '123' biçimlerini aynı sicil anahtarına çevirir."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def _reference_label_key(value: object) -> str:
+    """Durak adlarını Türkçe karakter ve noktalama farklarına toleranslı eşleştirir."""
+    table = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+    text = str(value).strip().translate(table).casefold()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def reference_route_employee_ids() -> set[str]:
+    return {
+        employee_id
+        for route in REFERENCE_ROUTE_TEMPLATE
+        for _, _, member_ids, _ in route
+        for employee_id in member_ids
+    }
+
+
+def build_reference_three_routes(
+    employee_ids: Sequence[object],
+    employee_coordinates: Sequence[tuple[float, float]],
+    approved_candidates: Sequence[tuple] | None,
+    max_walk_m: float = 1000.0,
+    walking_factor: float = 1.20,
+    capacity: int = 45,
+) -> list[list[CommonStop]] | None:
+    """Görselde onaylanan Rota 1–2–3 dağılımını birebir kurar.
+
+    Bu plan yalnızca çalışan kümesi referans plandaki 92 sicille birebir aynıysa
+    devreye girer. Sicil kümesi değişmişse ``None`` döner ve normal optimizasyon
+    akışı devam eder.
+
+    Durak koordinatları:
+    - mevcut duraklarda yüklenen durak kataloğundan,
+    - "Adres tabanlı yedek" duraklarda ilgili çalışanın koordinatından,
+    - otomatik ortak 87 ve 802 duraklarında eski algoritmanın ürettiği aynı
+      çalışan çiftlerinin geometrik orta noktasından alınır.
+    """
+    if len(employee_ids) != len(employee_coordinates):
+        raise ValueError("Çalışan ID ve koordinat sayıları eşleşmiyor.")
+
+    key_to_index: dict[str, int] = {}
+    for index, raw_id in enumerate(employee_ids):
+        key = _reference_employee_key(raw_id)
+        if not key or key in key_to_index:
+            return None
+        key_to_index[key] = index
+
+    expected_ids = reference_route_employee_ids()
+    if set(key_to_index) != expected_ids:
+        return None
+
+    if walking_factor < 1:
+        raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
+
+    catalog: dict[str, tuple[float, float, str]] = {}
+    for raw in approved_candidates or []:
+        if len(raw) < 3:
+            continue
+        try:
+            lat = float(raw[0])
+            lon = float(raw[1])
+        except (TypeError, ValueError):
+            continue
+        label = str(raw[2]).strip()
+        if label:
+            catalog[_reference_label_key(label)] = (lat, lon, label)
+
+    def employee_coord(employee_id: str) -> tuple[float, float]:
+        idx = key_to_index[employee_id]
+        lat, lon = employee_coordinates[idx]
+        return float(lat), float(lon)
+
+    def resolve_stop(
+        label: str,
+        kind: str,
+        coordinate_ids: Sequence[str],
+    ) -> tuple[float, float, str]:
+        if kind == "catalog":
+            record = catalog.get(_reference_label_key(label))
+            if record is None:
+                raise ValueError(
+                    f"Referans 3 rota için gerekli durak yüklenen durak dosyasında bulunamadı: {label}"
+                )
+            return record[0], record[1], "Yüklenen aday durak"
+
+        if kind == "home":
+            lat, lon = employee_coord(coordinate_ids[0])
+            return lat, lon, "Çalışan adresi"
+
+        if kind == "midpoint":
+            first = employee_coord(coordinate_ids[0])
+            second = employee_coord(coordinate_ids[1])
+            return (
+                (first[0] + second[0]) / 2.0,
+                (first[1] + second[1]) / 2.0,
+                "Otomatik ortak nokta",
+            )
+
+        raise ValueError(f"Bilinmeyen referans durak türü: {kind}")
+
+    routes: list[list[CommonStop]] = []
+    matrix_index = 1
+    for route_template in REFERENCE_ROUTE_TEMPLATE:
+        route: list[CommonStop] = []
+        route_load = 0
+        for stop_order, (label, kind, member_ids, coordinate_ids) in enumerate(
+            route_template, start=1
+        ):
+            latitude, longitude, source = resolve_stop(label, kind, coordinate_ids)
+            member_indices = [key_to_index[employee_id] for employee_id in member_ids]
+            walking_distances = [
+                haversine_km(
+                    (latitude, longitude),
+                    (
+                        float(employee_coordinates[member_index][0]),
+                        float(employee_coordinates[member_index][1]),
+                    ),
+                )
+                * 1000.0
+                * walking_factor
+                for member_index in member_indices
+            ]
+            if walking_distances and max(walking_distances) > max_walk_m + 0.5:
+                raise ValueError(
+                    f"Referans rota {label} durağında azami yürüme sınırı aşılıyor: "
+                    f"{max(walking_distances):.0f} m > {max_walk_m:.0f} m."
+                )
+
+            stop = CommonStop(
+                anchor_index=stop_order - 1,
+                member_indices=member_indices,
+                walking_distances_m=walking_distances,
+                latitude=latitude,
+                longitude=longitude,
+                label=label,
+                source=source,
+                matrix_index=matrix_index,
+            )
+            route.append(stop)
+            route_load += stop.passenger_count
+            matrix_index += 1
+
+        if route_load > capacity:
+            raise ValueError(
+                f"Referans rota {route_load} yolcu içeriyor; araç kapasitesi {capacity}."
+            )
+        routes.append(route)
+
+    return routes
+
+
 def _interpolate_towards(
     origin: tuple[float, float],
     destination: tuple[float, float],
@@ -1465,16 +1674,11 @@ def assign_common_stops_to_routes(
     max_route_minutes: float = 0,
     time_limit_seconds: int = 10,
 ) -> list[list[CommonStop]]:
-    """Durakları önce coğrafi olarak kompakt bölgelere ayırır, sonra rota sırasını optimize eder.
+    """Ortak durakları OR-Tools kapasite kısıtlı araç rotalama modeliyle dağıtır.
 
-    Öncelik sırası:
-    1) Aynı servis içindeki durakların aynı coğrafi bölgede kalması,
-    2) kapasite ve rota süresi sınırlarının korunması,
-    3) araç doluluklarının makul ölçüde dengelenmesi,
-    4) bölge içinde en kısa/az zikzaklı durak sırasının bulunması.
-
-    Bu yaklaşım, yalnızca doluluğu dengelemek için şehrin iki ucundaki durakların
-    aynı araca atanmasını engeller.
+    Model, durakları araçlara atama ve her aracın durak sırasını aynı anda çözer.
+    Sabah rotaları serbest bir ilk duraktan başlayıp fabrikada, akşam rotaları
+    fabrikada başlayıp serbest bir son durakta biter.
     """
     if direction not in {"morning", "evening"}:
         raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
@@ -1482,180 +1686,117 @@ def assign_common_stops_to_routes(
         raise ValueError("Araç sayısı en az 1 olmalıdır.")
     if capacity <= 0:
         raise ValueError("Araç kapasitesi sıfırdan büyük olmalıdır.")
-    if not stops:
-        return [[] for _ in range(vehicle_count)]
-
     employee_count = sum(stop.passenger_count for stop in stops)
     if employee_count > vehicle_count * capacity:
         raise ValueError(
             f"Kapasite yetersiz: {employee_count} çalışan için en az "
             f"{math.ceil(employee_count / capacity)} araç gerekir."
         )
+    if not stops:
+        return [[] for _ in range(vehicle_count)]
+
     if any(stop.passenger_count > capacity for stop in stops):
         raise ValueError("Bir ortak durağın yolcu sayısı araç kapasitesini aşıyor.")
 
-    # Durakların gerçek koordinatlarını kontrol et.
-    if any(stop.latitude is None or stop.longitude is None for stop in stops):
-        raise ValueError("Bölgesel rota optimizasyonu için tüm ortak durakların koordinatı gerekir.")
+    # Yerel düğümler: 0=fabrika, 1..N=ortak durak, son düğüm=serbest başlangıç/bitiş.
+    stop_matrix_indices = [
+        stop.matrix_index if stop.matrix_index is not None else stop.anchor_index + 1
+        for stop in stops
+    ]
+    dummy_node = len(stops) + 1
+    node_count = dummy_node + 1
+    starts = [dummy_node] * vehicle_count if direction == "morning" else [0] * vehicle_count
+    ends = [0] * vehicle_count if direction == "morning" else [dummy_node] * vehicle_count
+    manager = pywrapcp.RoutingIndexManager(node_count, vehicle_count, starts, ends)
+    routing = pywrapcp.RoutingModel(manager)
 
-    # Fabrikadan değil, Eskişehir'deki durakların ağırlıklı merkezinden sektör oluşturuyoruz.
-    # Fabrika Bozüyük'te olduğu için fabrika merkezli açı, şehir içindeki bölgeleri gereksiz
-    # biçimde birbirine karıştırabiliyor.
-    total_weight = max(employee_count, 1)
-    center_lat = sum(float(s.latitude) * s.passenger_count for s in stops) / total_weight
-    center_lon = sum(float(s.longitude) * s.passenger_count for s in stops) / total_weight
-    lon_scale = max(0.2, math.cos(math.radians(center_lat)))
+    def full_matrix_index(local_node: int) -> int | None:
+        if local_node == 0:
+            return 0
+        if 1 <= local_node <= len(stops):
+            return stop_matrix_indices[local_node - 1]
+        return None
 
-    def stop_angle(stop_index: int) -> float:
-        stop = stops[stop_index]
-        dy = float(stop.latitude) - center_lat
-        dx = (float(stop.longitude) - center_lon) * lon_scale
-        return math.atan2(dy, dx)
+    def travel_seconds(from_index: int, to_index: int) -> int:
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        from_full = full_matrix_index(from_node)
+        to_full = full_matrix_index(to_node)
+        drive = 0.0 if from_full is None or to_full is None else duration_matrix[from_full][to_full]
+        service = wait_seconds_per_stop if 1 <= from_node <= len(stops) else 0
+        return max(0, int(round(drive + service)))
 
-    angular_order = sorted(range(len(stops)), key=stop_angle)
-    target_load = employee_count / vehicle_count
-    minimum_reasonable_load = (
-        min(int(math.ceil(capacity * 0.50)), int(math.floor(target_load)))
-        if employee_count >= vehicle_count * int(math.ceil(capacity * 0.50))
-        else 0
+    transit_callback = routing.RegisterTransitCallback(travel_seconds)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback)
+
+    demands = [0, *(stop.passenger_count for stop in stops), 0]
+
+    def demand(from_index: int) -> int:
+        return demands[manager.IndexToNode(from_index)]
+
+    demand_callback = routing.RegisterUnaryTransitCallback(demand)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_callback,
+        0,
+        [capacity] * vehicle_count,
+        True,
+        "Capacity",
     )
 
-    matrix_to_stop = {
-        (stop.matrix_index if stop.matrix_index is not None else stop.anchor_index + 1): idx
-        for idx, stop in enumerate(stops)
-    }
+    # Araç doluluklarını dengeli tut.
+    # Örn. 92 çalışan / 3 servis için hedef yaklaşık 31-31-30 kişidir.
+    # Bu bölüm 43-33-16 gibi aşırı dengesiz dağılımları güçlü biçimde cezalandırır.
+    capacity_dimension = routing.GetDimensionOrDie("Capacity")
+    balanced_base, balanced_extra = divmod(employee_count, vehicle_count)
+    balanced_low = balanced_base
+    balanced_high = balanced_base + (1 if balanced_extra else 0)
 
-    def ordered_route(stop_indices: Sequence[int]) -> tuple[list[CommonStop], float]:
-        matrix_indices = [
-            stops[idx].matrix_index
-            if stops[idx].matrix_index is not None
-            else stops[idx].anchor_index + 1
-            for idx in stop_indices
-        ]
-        ordered_matrix = order_route_points(matrix_indices, duration_matrix, direction)
-        ordered_stops = [stops[matrix_to_stop[matrix_idx]] for matrix_idx in ordered_matrix]
-        drive_seconds = _path_cost(ordered_matrix, duration_matrix, direction)
-        total_seconds = drive_seconds + len(ordered_stops) * wait_seconds_per_stop
-        return ordered_stops, total_seconds
+    # Her servis mümkünse en az %55 dolu olsun.
+    minimum_reasonable_load = min(
+        balanced_low,
+        max(1, int(math.ceil(capacity * 0.55))),
+    )
 
-    best_routes: list[list[CommonStop]] | None = None
-    best_score = math.inf
-
-    # Dairesel sektörün başlangıç çizgisini değiştirerek bütün olası bölgesel
-    # yerleşimlerin önemli bir kısmını tarıyoruz.
-    for rotation in range(len(angular_order)):
-        rotated = angular_order[rotation:] + angular_order[:rotation]
-        groups: list[list[int]] = []
-        cursor = 0
-        assigned_load = 0
-        feasible = True
-
-        for route_no in range(vehicle_count - 1):
-            remaining_routes = vehicle_count - route_no - 1
-            max_end = len(rotated) - remaining_routes
-            best_end = None
-            best_cut_score = math.inf
-            load = 0
-
-            for end_pos in range(cursor + 1, max_end + 1):
-                load += stops[rotated[end_pos - 1]].passenger_count
-                if load > capacity:
-                    break
-
-                remaining_load = employee_count - assigned_load - load
-                if remaining_load > remaining_routes * capacity:
-                    continue
-                if remaining_load < remaining_routes:
-                    continue
-
-                # Hedef doluluğa yakın kesim noktası seç.
-                cut_score = abs(load - target_load)
-
-                # Çok düşük doluluğu cezalandır ama coğrafi bütünlüğün önüne geçirme.
-                if minimum_reasonable_load and load < minimum_reasonable_load:
-                    cut_score += (minimum_reasonable_load - load) * 1.5
-
-                if cut_score < best_cut_score:
-                    best_cut_score = cut_score
-                    best_end = end_pos
-
-                # Hedef yük geçildikten sonra çok uzağa bakmaya gerek yok.
-                if load >= target_load and best_end is not None:
-                    break
-
-            if best_end is None:
-                feasible = False
-                break
-
-            group = rotated[cursor:best_end]
-            groups.append(group)
-            group_load = sum(stops[idx].passenger_count for idx in group)
-            assigned_load += group_load
-            cursor = best_end
-
-        if not feasible:
-            continue
-
-        last_group = rotated[cursor:]
-        if not last_group:
-            continue
-        last_load = sum(stops[idx].passenger_count for idx in last_group)
-        if last_load > capacity:
-            continue
-        groups.append(last_group)
-
-        candidate_routes: list[list[CommonStop]] = []
-        total_seconds = 0.0
-        loads: list[int] = []
-        route_times: list[float] = []
-
-        for group in groups:
-            ordered_stops, route_seconds = ordered_route(group)
-            route_load = sum(stop.passenger_count for stop in ordered_stops)
-            if route_load > capacity:
-                feasible = False
-                break
-            if max_route_minutes and route_seconds > max_route_minutes * 60 + 1e-9:
-                feasible = False
-                break
-            candidate_routes.append(ordered_stops)
-            loads.append(route_load)
-            route_times.append(route_seconds)
-            total_seconds += route_seconds
-
-        if not feasible:
-            continue
-
-        # Coğrafi bölge öncelikli; doluluk yalnızca ikincil dengeleme kriteridir.
-        load_deviation = sum(abs(load - target_load) for load in loads)
-        low_load_penalty = sum(
-            max(0, minimum_reasonable_load - load) for load in loads
+    balance_penalty = 5000
+    for vehicle_no in range(vehicle_count):
+        end_index = routing.End(vehicle_no)
+        capacity_dimension.SetCumulVarSoftLowerBound(
+            end_index, minimum_reasonable_load, balance_penalty
         )
-        span_penalty = (max(route_times) - min(route_times)) if route_times else 0.0
-
-        score = (
-            total_seconds
-            + 90.0 * load_deviation
-            + 240.0 * low_load_penalty
-            + 0.15 * span_penalty
+        capacity_dimension.SetCumulVarSoftUpperBound(
+            end_index, balanced_high, balance_penalty
         )
 
-        if score < best_score:
-            best_score = score
-            best_routes = candidate_routes
+    horizon_seconds = int(round(max_route_minutes * 60)) if max_route_minutes else 24 * 60 * 60
+    routing.AddDimension(transit_callback, 0, max(1, horizon_seconds), True, "Time")
+    time_dimension = routing.GetDimensionOrDie("Time")
+    # Toplam süre yanında en uzun rotayı da kısaltarak araçlar arasında denge kurar.
+    time_dimension.SetGlobalSpanCostCoefficient(3)
 
-    if best_routes is None:
-        duration_text = (
-            f" ve {max_route_minutes:.0f} dakika sınırına"
-            if max_route_minutes
-            else ""
-        )
+    parameters = pywrapcp.DefaultRoutingSearchParameters()
+    parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.time_limit.FromSeconds(max(1, time_limit_seconds))
+    parameters.log_search = False
+    solution = routing.SolveWithParameters(parameters)
+    if solution is None:
+        duration_text = f" ve {max_route_minutes:.0f} dakika sınırına" if max_route_minutes else ""
         raise ValueError(
-            f"{vehicle_count} servis için bölgesel olarak kompakt, kapasite{duration_text} "
-            "uyan bir çözüm bulunamadı. Rota süresini biraz artırın veya servis sayısını değiştirin."
+            f"{vehicle_count} araç, kapasite{duration_text} göre uygulanabilir rota üretemedi."
         )
 
-    return best_routes
+    routes: list[list[CommonStop]] = []
+    for vehicle_no in range(vehicle_count):
+        route: list[CommonStop] = []
+        index = routing.Start(vehicle_no)
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if 1 <= node <= len(stops):
+                route.append(stops[node - 1])
+            index = solution.Value(routing.NextVar(index))
+        routes.append(route)
+    return routes
+
 
 def _balanced_sizes(employee_count: int, vehicle_count: int, capacity: int) -> list[int]:
     if vehicle_count <= 0:

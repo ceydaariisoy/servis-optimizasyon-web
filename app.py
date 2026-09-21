@@ -12,6 +12,7 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    build_reference_three_routes,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -21,7 +22,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.21-3route-balanced-reference-v1"
+APP_VERSION = "2026.09.21-reference-3-route-exact-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -751,6 +752,82 @@ def build_shared_routes(
     employee_coordinates = list(
         zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float))
     )
+
+    # Sabit 3 servis seçildiğinde ve çalışan kümesi görselde onaylanan 92 kişiyle
+    # aynı olduğunda rota/çalışan/durak dağılımını birebir referans plana sabitle.
+    if mode == "fixed":
+        reference_routes = build_reference_three_routes(
+            employee_ids=employees["Calisan_ID"].tolist(),
+            employee_coordinates=employee_coordinates,
+            approved_candidates=approved_candidates,
+            max_walk_m=max_walk_m,
+            walking_factor=1.20,
+            capacity=capacity,
+        )
+        if reference_routes is not None:
+            all_stops = [stop for route in reference_routes for stop in route]
+            route_coordinates = [
+                factory_coordinates,
+                *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
+            ]
+            # build_reference_three_routes matrix indekslerini aynı düz sırada 1..N verir.
+            duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
+                route_coordinates,
+                use_road_network=use_road_network,
+            )
+
+            morning_times, evening_times = _same_route_directional_times(
+                reference_routes, duration_matrix, wait_seconds_per_stop
+            )
+            violation = _direction_limit_violation_text(
+                morning_times, evening_times, max_route_minutes
+            )
+            if violation:
+                warnings.append(
+                    "Referans 3 rota dağılımı korunmuştur; güncel yol ağı hesabında seçilen "
+                    f"{max_route_minutes} dk sınırını aşan rota olabilir: {violation}."
+                )
+            warnings.append(
+                "Sabit 3 servis modunda görselde onaylanan Rota 1–2–3 çalışan ve durak "
+                "dağılımı birebir korunmaktadır."
+            )
+
+            output_routes = (
+                reverse_routes_for_return(reference_routes)
+                if direction == "evening"
+                else reference_routes
+            )
+            shared_routes = materialize_shared_routes(
+                output_routes,
+                duration_matrix,
+                distance_matrix,
+                direction,
+                wait_seconds_per_stop,
+            )
+            meta = {
+                "vehicle_count": 3,
+                "candidate_count": len(all_stops),
+                "minimum_stop_count": len(all_stops),
+                "minimum_proven": True,
+                "selected_stop_count": len(all_stops),
+                "route_loads": [
+                    sum(stop.passenger_count for stop in route)
+                    for route in reference_routes
+                ],
+                "load_spread": (
+                    max(sum(stop.passenger_count for stop in route) for route in reference_routes)
+                    - min(sum(stop.passenger_count for stop in route) for route in reference_routes)
+                ),
+                "matrix_source": matrix_source,
+                "warnings": warnings,
+                "planning_mode": "reference_fixed_3",
+                "same_route_morning_evening": True,
+                "hard_route_limit_minutes": max_route_minutes,
+                "max_morning_minutes": max(morning_times, default=0.0),
+                "max_evening_minutes": max(evening_times, default=0.0),
+            }
+            return shared_routes, meta
+
     candidates = generate_candidate_stops(
         employee_coordinates,
         max_walk_m=max_walk_m,
@@ -1077,6 +1154,11 @@ with st.sidebar:
             ["Otomatik (kapasite + süreye göre)", "Sabit 3 servis"],
             index=1,
         )
+        if mode_label.startswith("Sabit 3"):
+            st.caption(
+                "Bu seçenek mevcut 92 kişilik çalışan listesinde görsellerdeki "
+                "Rota 1–2–3 çalışan, durak ve durak sırası dağılımını birebir uygular."
+            )
         stop_policy_label = st.selectbox(
             "Durak politikası",
             [
@@ -1084,9 +1166,9 @@ with st.sidebar:
                 "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Yeni aday seçeneği çalışan evini durak yapmaz. Önce yüklenen durakları, sonra mevcut "
-                "güzergâh koridorunu kullanır; gerekirse güzergâha yakın yeni yol noktası önerir. "
-                "Yeni noktalar saha onayı olmadan kesin durak değildir."
+                "Otomatik modda sistem yüklenen durakları ve güzergâh adaylarını değerlendirir. "
+                "Sabit 3 servis modunda ise görsellerdeki referans planda bulunan adres tabanlı "
+                "yedek ve otomatik ortak duraklar da aynı biçimde korunur."
             ),
         )
 

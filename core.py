@@ -47,6 +47,9 @@ DETOUR_ROUTE_PENALTY_SECONDS = 180
 BALANCE_TOLERANCE_PASSENGERS = 3
 COMFORT_EXTRA_STOP_LIMIT = 3
 COMFORT_MIN_TOTAL_IMPROVEMENT_M = 120.0
+EXISTING_CONSOLIDATION_EXTRA_WALK_M = 160.0
+REGIONAL_LOAD_TOLERANCE_PASSENGERS = 6
+REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS = 1800
 
 
 @dataclass
@@ -85,6 +88,7 @@ class CommonStop:
     source: str = ROUTE_CORRIDOR_SOURCE
     matrix_index: int | None = None
     route_group: str = ""
+    region_id: int = -1
 
     @property
     def passenger_count(self) -> int:
@@ -870,15 +874,25 @@ def optimize_candidate_stops(
         ]
 
         if uploaded_covering:
-            # Kullanıcının istediği kural: sınır içindeyse EN YAKIN mevcut durağa yürü.
-            nearest_existing_stop = min(
-                uploaded_covering,
-                key=lambda candidate_index: (
-                    distances_m[candidate_index][employee_index],
-                    candidate_index,
-                ),
+            # En yakın mevcut durak ana tercihtir. Ancak sırf birkaç yüz metre farkla
+            # ayrı bir servis durağı açılmasını önlemek için, en yakın durağa göre
+            # en fazla EXISTING_CONSOLIDATION_EXTRA_WALK_M kadar ek yürüyüş gerektiren
+            # diğer mevcut duraklar da konsolidasyon adayı olabilir.
+            nearest_distance = min(
+                distances_m[candidate_index][employee_index]
+                for candidate_index in uploaded_covering
             )
-            eligible_by_employee.append([nearest_existing_stop])
+            consolidation_limit = min(
+                max_walk_m,
+                nearest_distance + EXISTING_CONSOLIDATION_EXTRA_WALK_M,
+            )
+            near_existing_stops = [
+                candidate_index
+                for candidate_index in uploaded_covering
+                if distances_m[candidate_index][employee_index]
+                <= consolidation_limit + 1e-9
+            ]
+            eligible_by_employee.append(near_existing_stops)
         else:
             eligible_by_employee.append(list(covering))
 
@@ -1793,6 +1807,165 @@ def _allocate_unsplit_common_stops(
     return routes
 
 
+
+def _capacitated_geographic_regions(
+    stops: Sequence[CommonStop],
+    vehicle_count: int,
+    capacity: int,
+) -> list[int]:
+    """Durakları coğrafi olarak kompakt ve kapasiteye yakın bölgelere ayırır.
+
+    Bu yalnızca optimizasyon önceliğidir; gerçek rota süre kısıtı ayrı tutulur.
+    Her bölgenin toplam yolcusu kapasiteyi aşmayacak biçimde deterministik,
+    ağırlıklı bir k-means/greedy hibriti kullanılır.
+    """
+    if not stops:
+        return []
+    if vehicle_count <= 1:
+        return [0] * len(stops)
+
+    lat0 = sum(float(stop.latitude) for stop in stops) / len(stops)
+    lon0 = sum(float(stop.longitude) for stop in stops) / len(stops)
+    meters_per_lat = 111_320.0
+    meters_per_lon = 111_320.0 * max(math.cos(math.radians(lat0)), 1e-6)
+
+    points = [
+        (
+            (float(stop.longitude) - lon0) * meters_per_lon,
+            (float(stop.latitude) - lat0) * meters_per_lat,
+        )
+        for stop in stops
+    ]
+    weights = [max(1, int(stop.passenger_count)) for stop in stops]
+    total_load = sum(weights)
+    target = total_load / vehicle_count
+    regional_max = min(
+        capacity,
+        max(
+            int(math.ceil(target)) + REGIONAL_LOAD_TOLERANCE_PASSENGERS,
+            max(weights),
+        ),
+    )
+
+    # Farthest-first başlangıç merkezleri: şehrin farklı uçlarını seçer.
+    weighted_center = (
+        sum(x * w for (x, _), w in zip(points, weights)) / total_load,
+        sum(y * w for (_, y), w in zip(points, weights)) / total_load,
+    )
+    first_seed = max(
+        range(len(points)),
+        key=lambda i: (points[i][0] - weighted_center[0]) ** 2
+        + (points[i][1] - weighted_center[1]) ** 2,
+    )
+    seeds = [first_seed]
+    while len(seeds) < min(vehicle_count, len(points)):
+        next_seed = max(
+            (i for i in range(len(points)) if i not in seeds),
+            key=lambda i: min(
+                (points[i][0] - points[j][0]) ** 2
+                + (points[i][1] - points[j][1]) ** 2
+                for j in seeds
+            ),
+        )
+        seeds.append(next_seed)
+
+    centroids = [points[seed] for seed in seeds]
+    while len(centroids) < vehicle_count:
+        centroids.append(weighted_center)
+
+    assignments = [0] * len(stops)
+
+    for _ in range(12):
+        loads = [0] * vehicle_count
+        new_assignments = [-1] * len(stops)
+
+        # Her bölgenin çekirdeğini önce yerleştirerek boş bölge riskini azalt.
+        used_seed_indices = set()
+        for region_id, seed_index in enumerate(seeds):
+            if region_id >= vehicle_count:
+                break
+            new_assignments[seed_index] = region_id
+            loads[region_id] += weights[seed_index]
+            used_seed_indices.add(seed_index)
+
+        # Büyük ve bölgesel olarak belirgin duraklar önce atanır.
+        remaining = [i for i in range(len(stops)) if i not in used_seed_indices]
+        remaining.sort(
+            key=lambda i: (
+                -weights[i],
+                -min(
+                    (points[i][0] - c[0]) ** 2 + (points[i][1] - c[1]) ** 2
+                    for c in centroids
+                ),
+                i,
+            )
+        )
+
+        for i in remaining:
+            ranked_regions = sorted(
+                range(vehicle_count),
+                key=lambda r: (
+                    (points[i][0] - centroids[r][0]) ** 2
+                    + (points[i][1] - centroids[r][1]) ** 2,
+                    loads[r],
+                    r,
+                ),
+            )
+            chosen = None
+            for region_id in ranked_regions:
+                if loads[region_id] + weights[i] <= regional_max:
+                    chosen = region_id
+                    break
+            if chosen is None:
+                # Bölgesel hedef dolmuşsa gerçek araç kapasitesine göre en yakın uygun bölge.
+                for region_id in ranked_regions:
+                    if loads[region_id] + weights[i] <= capacity:
+                        chosen = region_id
+                        break
+            if chosen is None:
+                chosen = min(range(vehicle_count), key=lambda r: (loads[r], r))
+            new_assignments[i] = chosen
+            loads[chosen] += weights[i]
+
+        new_centroids = []
+        for region_id in range(vehicle_count):
+            members = [i for i, value in enumerate(new_assignments) if value == region_id]
+            if not members:
+                new_centroids.append(centroids[region_id])
+                continue
+            member_weight = sum(weights[i] for i in members)
+            new_centroids.append(
+                (
+                    sum(points[i][0] * weights[i] for i in members) / member_weight,
+                    sum(points[i][1] * weights[i] for i in members) / member_weight,
+                )
+            )
+
+        if new_assignments == assignments:
+            assignments = new_assignments
+            break
+        assignments = new_assignments
+        centroids = new_centroids
+
+    # Bölge numaralarını batıdan doğuya, eşitlikte kuzeyden güneye sırala.
+    region_centers = []
+    for region_id in range(vehicle_count):
+        members = [i for i, value in enumerate(assignments) if value == region_id]
+        if members:
+            member_weight = sum(weights[i] for i in members)
+            center = (
+                sum(points[i][0] * weights[i] for i in members) / member_weight,
+                sum(points[i][1] * weights[i] for i in members) / member_weight,
+            )
+        else:
+            center = centroids[region_id]
+        region_centers.append((region_id, center))
+
+    ordered_regions = sorted(region_centers, key=lambda item: (item[1][0], -item[1][1]))
+    remap = {old: new for new, (old, _) in enumerate(ordered_regions)}
+    return [remap[value] for value in assignments]
+
+
 def assign_common_stops_to_routes(
     stops: Sequence[CommonStop],
     coordinates: Sequence[tuple[float, float]],
@@ -1809,6 +1982,8 @@ def assign_common_stops_to_routes(
     Önceki sürüm tam doluluk dengesini çok güçlü cezalandırdığı için bazı rotalar
     farklı bölgeleri kesebiliyordu. Bu sürümde:
     - 30/31/31 gibi denge hâlâ teşvik edilir ama ±3 yolcu tolerans tanınır.
+    - Duraklar önce coğrafi olarak kompakt  bölgelere ayrılır.
+    - Her araç kendi bölgesini güçlü biçimde tercih eder; gereksiz bölge geçişi pahalıdır.
     - Farklı mevcut rota koridorları arasında geçişe ek maliyet verilir.
     - Tek kişilik otomatik/sapmalı yeni durağa rota maliyeti eklenir.
     - Gerçek süre kısıtı bu cezalardan etkilenmez; süre boyutu yalnızca gerçek
@@ -1841,6 +2016,16 @@ def assign_common_stops_to_routes(
         else stop.anchor_index + 1
         for stop in stops
     ]
+
+    # Önce coğrafi olarak kompakt bölgeler oluştur. Bölge ataması gerçek süreye
+    # eklenmez; yalnızca hangi aracın hangi durak kümesini tercih edeceğini yönlendirir.
+    regional_assignments = _capacitated_geographic_regions(
+        stops,
+        vehicle_count,
+        capacity,
+    )
+    for stop, region_id in zip(stops, regional_assignments):
+        stop.region_id = region_id
 
     dummy_node = len(stops) + 1
     node_count = dummy_node + 1
@@ -1901,8 +2086,12 @@ def assign_common_stops_to_routes(
             int(round(drive + service)),
         )
 
-    def optimization_cost(from_index: int, to_index: int) -> int:
-        """Rota seçimi maliyeti: gerçek süre + bölgesel/sapma cezaları."""
+    def optimization_cost_for_vehicle(
+        vehicle_no: int,
+        from_index: int,
+        to_index: int,
+    ) -> int:
+        """Gerçek süre + coğrafi bölge/koridor/sapma tercih maliyeti."""
         cost = real_travel_seconds(from_index, to_index)
 
         from_node = manager.IndexToNode(from_index)
@@ -1911,15 +2100,26 @@ def assign_common_stops_to_routes(
         from_stop = stop_for_local_node(from_node)
         to_stop = stop_for_local_node(to_node)
 
+        # Aracın kendi coğrafi kümesinin dışındaki durağa gitmesi güçlü biçimde
+        # cezalandırılır. Bu soft kuraldır; süre/kapasite gerektirirse çözücü aşabilir.
+        if to_stop is not None and getattr(to_stop, "region_id", -1) >= 0:
+            if int(to_stop.region_id) != int(vehicle_no):
+                cost += REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS
+
         if from_stop is not None and to_stop is not None:
+            if (
+                getattr(from_stop, "region_id", -1) >= 0
+                and getattr(to_stop, "region_id", -1) >= 0
+                and from_stop.region_id != to_stop.region_id
+            ):
+                cost += REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS // 2
+
             group_a = str(getattr(from_stop, "route_group", "") or "").strip().casefold()
             group_b = str(getattr(to_stop, "route_group", "") or "").strip().casefold()
 
-            # VitrA Karo 1 -> VitrA Karo 3 gibi koridor geçişlerini azalt.
             if group_a and group_b and group_a != group_b:
                 cost += REGIONAL_SWITCH_PENALTY_SECONDS
 
-        # Tek kişilik otomatik durağa girmek operasyonel olarak pahalı kabul edilir.
         if to_stop is not None:
             if (
                 to_stop.passenger_count == 1
@@ -1937,16 +2137,15 @@ def assign_common_stops_to_routes(
 
         return max(0, int(cost))
 
-    time_callback = routing.RegisterTransitCallback(
-        real_travel_seconds
-    )
-    cost_callback = routing.RegisterTransitCallback(
-        optimization_cost
-    )
+    time_callback = routing.RegisterTransitCallback(real_travel_seconds)
 
-    routing.SetArcCostEvaluatorOfAllVehicles(
-        cost_callback
-    )
+    # Her araç için ayrı maliyet callback'i kullanarak araç-bölge eşleşmesini koru.
+    for vehicle_no in range(vehicle_count):
+        def vehicle_cost(from_index: int, to_index: int, v=vehicle_no) -> int:
+            return optimization_cost_for_vehicle(v, from_index, to_index)
+
+        callback_index = routing.RegisterTransitCallback(vehicle_cost)
+        routing.SetArcCostEvaluatorOfVehicle(callback_index, vehicle_no)
 
     demands = [
         0,

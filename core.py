@@ -5,7 +5,7 @@ Yol süreleri için önce OSRM denenir; servis erişilemezse kuş uçuşu mesafe
 tabanlı tahmine otomatik geçilir.
 
 Durak politikası:
-- Yürüme sınırı içindeki yüklenen/mevcut duraklar kesin önceliklidir; çalışan en yakınına atanır.
+- Yürüme sınırı içindeki yüklenen/mevcut duraklar önceliklidir; yakın duraklar yalnızca küçük ek yürüyüşle konsolide edilebilir.
 - Çalışan koordinatları hiçbir zaman servis durağı olarak kullanılmaz.
 - Mevcut durağa yürüyemeyen çalışan için güzergâh üzerinde veya güzergâha doğru
   minimum sapmalı yeni bir aday üretilir; seçilen otomatik aday mümkünse OSRM ile yola oturtulur.
@@ -45,11 +45,17 @@ REGIONAL_SWITCH_PENALTY_SECONDS = 420
 SINGLE_AUTOMATIC_ROUTE_PENALTY_SECONDS = 240
 DETOUR_ROUTE_PENALTY_SECONDS = 180
 BALANCE_TOLERANCE_PASSENGERS = 3
-COMFORT_EXTRA_STOP_LIMIT = 3
-COMFORT_MIN_TOTAL_IMPROVEMENT_M = 120.0
-EXISTING_CONSOLIDATION_EXTRA_WALK_M = 160.0
-REGIONAL_LOAD_TOLERANCE_PASSENGERS = 6
-REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS = 1800
+
+# Kontrollü durak konsolidasyonu (v6):
+# En yakın mevcut durağa göre yalnızca küçük ek yürüyüş kabul edilir.
+# Böylece 500 m yerine 900 m gibi sert yönlendirmeler yapılmadan yakın duraklar birleşebilir.
+CONSOLIDATION_MAX_EXTRA_WALK_M = 120.0
+CONSOLIDATION_ABSOLUTE_WALK_CAP_M = 800.0
+
+# Konfor hedefi uğruna kapatılan durakların tekrar açılmasını sınırlıyoruz.
+COMFORT_EXTRA_STOP_LIMIT = 1
+COMFORT_MIN_TOTAL_IMPROVEMENT_M = 350.0
+COMFORT_MIN_AFFECTED_EMPLOYEES = 3
 
 
 @dataclass
@@ -88,7 +94,6 @@ class CommonStop:
     source: str = ROUTE_CORRIDOR_SOURCE
     matrix_index: int | None = None
     route_group: str = ""
-    region_id: int = -1
 
     @property
     def passenger_count(self) -> int:
@@ -811,7 +816,7 @@ def optimize_candidate_stops(
     """Aday durakları yürüme, ortaklaştırma ve güzergâh uygunluğuna göre seçer.
 
     Politika:
-    - Mevcut/yüklenen durağa yürüyebilen çalışan EN YAKIN mevcut durağa sabitlenir.
+    - Mevcut/yüklenen duraklarda en yakın durak referanstır; en fazla 120 m ek yürüyüşle yakın duraklar konsolide edilebilir.
     - Mevcut durağı olmayan çalışanlarda 2+ kişilik ortak otomatik adaylar,
       tek kişilik yeni duraklara göre güçlü biçimde tercih edilir.
     - Ortalama yürüyüş hedefi SOFT hedeftir; yalnızca birkaç anlamlı ek durakla
@@ -874,26 +879,47 @@ def optimize_candidate_stops(
         ]
 
         if uploaded_covering:
-            # En yakın mevcut durak ana tercihtir. Ancak sırf birkaç yüz metre farkla
-            # ayrı bir servis durağı açılmasını önlemek için, en yakın durağa göre
-            # en fazla EXISTING_CONSOLIDATION_EXTRA_WALK_M kadar ek yürüyüş gerektiren
-            # diğer mevcut duraklar da konsolidasyon adayı olabilir.
+            # v6 kontrollü konsolidasyon:
+            # Çalışanın en yakın mevcut durağı temel referanstır. Ancak ikinci bir
+            # mevcut durak yalnızca çok küçük bir ek yürüyüş gerektiriyorsa aynı
+            # ortak durakta birleşmeye izin verilir.
             nearest_distance = min(
                 distances_m[candidate_index][employee_index]
                 for candidate_index in uploaded_covering
             )
-            consolidation_limit = min(
-                max_walk_m,
-                nearest_distance + EXISTING_CONSOLIDATION_EXTRA_WALK_M,
-            )
-            near_existing_stops = [
+
+            # En yakın durak zaten 800 m'nin üzerindeyse çalışanı daha da uzağa
+            # göndermeyiz; sadece en yakın durağı uygun bırakırız.
+            if nearest_distance > CONSOLIDATION_ABSOLUTE_WALK_CAP_M:
+                allowed_limit = nearest_distance + 1e-9
+            else:
+                allowed_limit = min(
+                    max_walk_m,
+                    CONSOLIDATION_ABSOLUTE_WALK_CAP_M,
+                    nearest_distance + CONSOLIDATION_MAX_EXTRA_WALK_M,
+                )
+
+            eligible_existing = [
                 candidate_index
                 for candidate_index in uploaded_covering
-                if distances_m[candidate_index][employee_index]
-                <= consolidation_limit + 1e-9
+                if distances_m[candidate_index][employee_index] <= allowed_limit + 1e-9
             ]
-            eligible_by_employee.append(near_existing_stops)
+
+            # Sayısal tolerans nedeniyle liste boş kalırsa en yakın durağı koru.
+            if not eligible_existing:
+                nearest_existing_stop = min(
+                    uploaded_covering,
+                    key=lambda candidate_index: (
+                        distances_m[candidate_index][employee_index],
+                        candidate_index,
+                    ),
+                )
+                eligible_existing = [nearest_existing_stop]
+
+            eligible_by_employee.append(eligible_existing)
         else:
+            # Mevcut durağa yürüyemeyen çalışanlarda otomatik güzergâh adayları
+            # kullanılabilir. Ev koordinatı yine doğrudan durak değildir.
             eligible_by_employee.append(list(covering))
 
     # Her adayın gerçekten kaç çalışanın uygun listesinde bulunduğunu hesapla.
@@ -906,12 +932,12 @@ def optimize_candidate_stops(
     ]
 
     source_penalty = {
-        "Yüklenen aday durak": 0,
-        "Onaylı durak": 0,
-        "Mevcut durak": 0,
-        ROUTE_CORRIDOR_SOURCE: 20,
-        "Otomatik ortak nokta": 10,
-        ROUTE_DETOUR_SOURCE: 80,
+        "Yüklenen aday durak": 45,
+        "Onaylı durak": 45,
+        "Mevcut durak": 45,
+        ROUTE_CORRIDOR_SOURCE: 70,
+        "Otomatik ortak nokta": 35,
+        ROUTE_DETOUR_SOURCE: 150,
     }
 
     model = cp_model.CpModel()
@@ -923,8 +949,10 @@ def optimize_candidate_stops(
     for covering in eligible_by_employee:
         model.add(sum(selected_vars[index] for index in covering) >= 1)
 
-    # Durak sayısı hâlâ ana amaç; ancak eşit durak sayısında tek kişilik
-    # otomatik noktalar ve sapmalı noktalar belirgin biçimde pahalıdır.
+    # Birincil amaç kesin olarak toplam durak sayısını azaltmaktır.
+    # İkincil amaçta aynı durak sayısındaki çözümler arasında daha çok çalışanın
+    # kullanabileceği ortak/mevcut duraklar tercih edilir. Böylece birbirine çok
+    # yakın iki mevcut duraktan biri, yürüyüş farkı küçükse kapanabilir.
     PRIMARY_STOP_WEIGHT = 1_000_000
 
     objective_terms = []
@@ -932,16 +960,20 @@ def optimize_candidate_stops(
         candidate = candidates[candidate_index]
         coverage_count = effective_coverage_count[candidate_index]
 
-        penalty = source_penalty.get(candidate.source, 100)
+        penalty = source_penalty.get(candidate.source, 180)
+
+        if candidate.source in uploaded_sources:
+            # Çok kişiyi kapsayabilen mevcut durağı eşit durak sayısında öne çıkar.
+            penalty = max(0, penalty - 9 * min(coverage_count, 5))
 
         if candidate.source in automatic_sources:
             if coverage_count <= 1:
-                penalty += 300
+                # Tek kişilik yeni otomatik durak son çare olsun.
+                penalty += 420
             elif coverage_count == 2:
-                penalty += 30
+                penalty += 45
             else:
-                # 3+ kişiyi birleştiren ortak adaylara küçük ödül.
-                penalty = max(0, penalty - 5 * min(coverage_count, 6))
+                penalty = max(0, penalty - 8 * min(coverage_count, 6))
 
         objective_terms.append(
             variable * (PRIMARY_STOP_WEIGHT + penalty)
@@ -1026,8 +1058,14 @@ def optimize_candidate_stops(
                 if candidate_index in eligible_by_employee[employee_index]
             ]
 
-            # Tek kişilik otomatik adaylar sadece yürüyüş ortalamasını düşürmek
-            # için ek durak haline gelmesin.
+            # Konsolidasyonla kapatılan bir durağı sırf küçük bir konfor kazancı
+            # için tekrar açmayalım. Ek durak ancak en az 3 çalışanı anlamlı
+            # biçimde etkiliyorsa değerlendirilsin.
+            if len(eligible_employees) < COMFORT_MIN_AFFECTED_EMPLOYEES:
+                continue
+
+            # Tek kişilik otomatik adaylar hiçbir durumda yalnızca konfor hedefi
+            # için ek durak haline gelmez.
             if (
                 candidate.source in automatic_sources
                 and len(eligible_employees) <= 1
@@ -1807,165 +1845,6 @@ def _allocate_unsplit_common_stops(
     return routes
 
 
-
-def _capacitated_geographic_regions(
-    stops: Sequence[CommonStop],
-    vehicle_count: int,
-    capacity: int,
-) -> list[int]:
-    """Durakları coğrafi olarak kompakt ve kapasiteye yakın bölgelere ayırır.
-
-    Bu yalnızca optimizasyon önceliğidir; gerçek rota süre kısıtı ayrı tutulur.
-    Her bölgenin toplam yolcusu kapasiteyi aşmayacak biçimde deterministik,
-    ağırlıklı bir k-means/greedy hibriti kullanılır.
-    """
-    if not stops:
-        return []
-    if vehicle_count <= 1:
-        return [0] * len(stops)
-
-    lat0 = sum(float(stop.latitude) for stop in stops) / len(stops)
-    lon0 = sum(float(stop.longitude) for stop in stops) / len(stops)
-    meters_per_lat = 111_320.0
-    meters_per_lon = 111_320.0 * max(math.cos(math.radians(lat0)), 1e-6)
-
-    points = [
-        (
-            (float(stop.longitude) - lon0) * meters_per_lon,
-            (float(stop.latitude) - lat0) * meters_per_lat,
-        )
-        for stop in stops
-    ]
-    weights = [max(1, int(stop.passenger_count)) for stop in stops]
-    total_load = sum(weights)
-    target = total_load / vehicle_count
-    regional_max = min(
-        capacity,
-        max(
-            int(math.ceil(target)) + REGIONAL_LOAD_TOLERANCE_PASSENGERS,
-            max(weights),
-        ),
-    )
-
-    # Farthest-first başlangıç merkezleri: şehrin farklı uçlarını seçer.
-    weighted_center = (
-        sum(x * w for (x, _), w in zip(points, weights)) / total_load,
-        sum(y * w for (_, y), w in zip(points, weights)) / total_load,
-    )
-    first_seed = max(
-        range(len(points)),
-        key=lambda i: (points[i][0] - weighted_center[0]) ** 2
-        + (points[i][1] - weighted_center[1]) ** 2,
-    )
-    seeds = [first_seed]
-    while len(seeds) < min(vehicle_count, len(points)):
-        next_seed = max(
-            (i for i in range(len(points)) if i not in seeds),
-            key=lambda i: min(
-                (points[i][0] - points[j][0]) ** 2
-                + (points[i][1] - points[j][1]) ** 2
-                for j in seeds
-            ),
-        )
-        seeds.append(next_seed)
-
-    centroids = [points[seed] for seed in seeds]
-    while len(centroids) < vehicle_count:
-        centroids.append(weighted_center)
-
-    assignments = [0] * len(stops)
-
-    for _ in range(12):
-        loads = [0] * vehicle_count
-        new_assignments = [-1] * len(stops)
-
-        # Her bölgenin çekirdeğini önce yerleştirerek boş bölge riskini azalt.
-        used_seed_indices = set()
-        for region_id, seed_index in enumerate(seeds):
-            if region_id >= vehicle_count:
-                break
-            new_assignments[seed_index] = region_id
-            loads[region_id] += weights[seed_index]
-            used_seed_indices.add(seed_index)
-
-        # Büyük ve bölgesel olarak belirgin duraklar önce atanır.
-        remaining = [i for i in range(len(stops)) if i not in used_seed_indices]
-        remaining.sort(
-            key=lambda i: (
-                -weights[i],
-                -min(
-                    (points[i][0] - c[0]) ** 2 + (points[i][1] - c[1]) ** 2
-                    for c in centroids
-                ),
-                i,
-            )
-        )
-
-        for i in remaining:
-            ranked_regions = sorted(
-                range(vehicle_count),
-                key=lambda r: (
-                    (points[i][0] - centroids[r][0]) ** 2
-                    + (points[i][1] - centroids[r][1]) ** 2,
-                    loads[r],
-                    r,
-                ),
-            )
-            chosen = None
-            for region_id in ranked_regions:
-                if loads[region_id] + weights[i] <= regional_max:
-                    chosen = region_id
-                    break
-            if chosen is None:
-                # Bölgesel hedef dolmuşsa gerçek araç kapasitesine göre en yakın uygun bölge.
-                for region_id in ranked_regions:
-                    if loads[region_id] + weights[i] <= capacity:
-                        chosen = region_id
-                        break
-            if chosen is None:
-                chosen = min(range(vehicle_count), key=lambda r: (loads[r], r))
-            new_assignments[i] = chosen
-            loads[chosen] += weights[i]
-
-        new_centroids = []
-        for region_id in range(vehicle_count):
-            members = [i for i, value in enumerate(new_assignments) if value == region_id]
-            if not members:
-                new_centroids.append(centroids[region_id])
-                continue
-            member_weight = sum(weights[i] for i in members)
-            new_centroids.append(
-                (
-                    sum(points[i][0] * weights[i] for i in members) / member_weight,
-                    sum(points[i][1] * weights[i] for i in members) / member_weight,
-                )
-            )
-
-        if new_assignments == assignments:
-            assignments = new_assignments
-            break
-        assignments = new_assignments
-        centroids = new_centroids
-
-    # Bölge numaralarını batıdan doğuya, eşitlikte kuzeyden güneye sırala.
-    region_centers = []
-    for region_id in range(vehicle_count):
-        members = [i for i, value in enumerate(assignments) if value == region_id]
-        if members:
-            member_weight = sum(weights[i] for i in members)
-            center = (
-                sum(points[i][0] * weights[i] for i in members) / member_weight,
-                sum(points[i][1] * weights[i] for i in members) / member_weight,
-            )
-        else:
-            center = centroids[region_id]
-        region_centers.append((region_id, center))
-
-    ordered_regions = sorted(region_centers, key=lambda item: (item[1][0], -item[1][1]))
-    remap = {old: new for new, (old, _) in enumerate(ordered_regions)}
-    return [remap[value] for value in assignments]
-
-
 def assign_common_stops_to_routes(
     stops: Sequence[CommonStop],
     coordinates: Sequence[tuple[float, float]],
@@ -1982,8 +1861,6 @@ def assign_common_stops_to_routes(
     Önceki sürüm tam doluluk dengesini çok güçlü cezalandırdığı için bazı rotalar
     farklı bölgeleri kesebiliyordu. Bu sürümde:
     - 30/31/31 gibi denge hâlâ teşvik edilir ama ±3 yolcu tolerans tanınır.
-    - Duraklar önce coğrafi olarak kompakt  bölgelere ayrılır.
-    - Her araç kendi bölgesini güçlü biçimde tercih eder; gereksiz bölge geçişi pahalıdır.
     - Farklı mevcut rota koridorları arasında geçişe ek maliyet verilir.
     - Tek kişilik otomatik/sapmalı yeni durağa rota maliyeti eklenir.
     - Gerçek süre kısıtı bu cezalardan etkilenmez; süre boyutu yalnızca gerçek
@@ -2016,16 +1893,6 @@ def assign_common_stops_to_routes(
         else stop.anchor_index + 1
         for stop in stops
     ]
-
-    # Önce coğrafi olarak kompakt bölgeler oluştur. Bölge ataması gerçek süreye
-    # eklenmez; yalnızca hangi aracın hangi durak kümesini tercih edeceğini yönlendirir.
-    regional_assignments = _capacitated_geographic_regions(
-        stops,
-        vehicle_count,
-        capacity,
-    )
-    for stop, region_id in zip(stops, regional_assignments):
-        stop.region_id = region_id
 
     dummy_node = len(stops) + 1
     node_count = dummy_node + 1
@@ -2086,12 +1953,8 @@ def assign_common_stops_to_routes(
             int(round(drive + service)),
         )
 
-    def optimization_cost_for_vehicle(
-        vehicle_no: int,
-        from_index: int,
-        to_index: int,
-    ) -> int:
-        """Gerçek süre + coğrafi bölge/koridor/sapma tercih maliyeti."""
+    def optimization_cost(from_index: int, to_index: int) -> int:
+        """Rota seçimi maliyeti: gerçek süre + bölgesel/sapma cezaları."""
         cost = real_travel_seconds(from_index, to_index)
 
         from_node = manager.IndexToNode(from_index)
@@ -2100,26 +1963,15 @@ def assign_common_stops_to_routes(
         from_stop = stop_for_local_node(from_node)
         to_stop = stop_for_local_node(to_node)
 
-        # Aracın kendi coğrafi kümesinin dışındaki durağa gitmesi güçlü biçimde
-        # cezalandırılır. Bu soft kuraldır; süre/kapasite gerektirirse çözücü aşabilir.
-        if to_stop is not None and getattr(to_stop, "region_id", -1) >= 0:
-            if int(to_stop.region_id) != int(vehicle_no):
-                cost += REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS
-
         if from_stop is not None and to_stop is not None:
-            if (
-                getattr(from_stop, "region_id", -1) >= 0
-                and getattr(to_stop, "region_id", -1) >= 0
-                and from_stop.region_id != to_stop.region_id
-            ):
-                cost += REGIONAL_WRONG_VEHICLE_PENALTY_SECONDS // 2
-
             group_a = str(getattr(from_stop, "route_group", "") or "").strip().casefold()
             group_b = str(getattr(to_stop, "route_group", "") or "").strip().casefold()
 
+            # VitrA Karo 1 -> VitrA Karo 3 gibi koridor geçişlerini azalt.
             if group_a and group_b and group_a != group_b:
                 cost += REGIONAL_SWITCH_PENALTY_SECONDS
 
+        # Tek kişilik otomatik durağa girmek operasyonel olarak pahalı kabul edilir.
         if to_stop is not None:
             if (
                 to_stop.passenger_count == 1
@@ -2137,15 +1989,16 @@ def assign_common_stops_to_routes(
 
         return max(0, int(cost))
 
-    time_callback = routing.RegisterTransitCallback(real_travel_seconds)
+    time_callback = routing.RegisterTransitCallback(
+        real_travel_seconds
+    )
+    cost_callback = routing.RegisterTransitCallback(
+        optimization_cost
+    )
 
-    # Her araç için ayrı maliyet callback'i kullanarak araç-bölge eşleşmesini koru.
-    for vehicle_no in range(vehicle_count):
-        def vehicle_cost(from_index: int, to_index: int, v=vehicle_no) -> int:
-            return optimization_cost_for_vehicle(v, from_index, to_index)
-
-        callback_index = routing.RegisterTransitCallback(vehicle_cost)
-        routing.SetArcCostEvaluatorOfVehicle(callback_index, vehicle_no)
+    routing.SetArcCostEvaluatorOfAllVehicles(
+        cost_callback
+    )
 
     demands = [
         0,

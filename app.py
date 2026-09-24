@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.24-regional-cluster-v5"
+APP_VERSION = "2026.09.24-controlled-consolidation-v6"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60

@@ -12,7 +12,6 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
-    consolidate_allocated_routes,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -22,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.24-stable-postmerge-v7"
+APP_VERSION = "2026.09.24-stable-postmerge-v7.1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -292,6 +291,267 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+
+def _local_haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """İki koordinat arasındaki kuş uçuşu mesafeyi km olarak hesaplar."""
+    radius_km = 6371.0088
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * radius_km * math.asin(math.sqrt(h))
+
+
+def consolidate_allocated_routes(
+    routes,
+    employee_coordinates,
+    duration_matrix,
+    max_walk_m,
+    wait_seconds_per_stop,
+    max_route_minutes=0,
+    walking_factor=1.20,
+    max_extra_walk_m=180.0,
+    absolute_walk_cap_m=900.0,
+    max_stop_distance_m=1400.0,
+    max_passes=20,
+):
+    """Ana rota dağılımını bozmadan aynı rota içindeki yakın durakları birleştirir."""
+
+    automatic_sources = {
+        "Güzergâh üzeri aday durak",
+        "Güzergâha yakın yeni durak",
+        "Otomatik ortak nokta",
+    }
+
+    def clone_stop(stop):
+        cloned = CommonStop(
+            anchor_index=stop.anchor_index,
+            member_indices=list(stop.member_indices),
+            walking_distances_m=list(stop.walking_distances_m),
+            latitude=float(stop.latitude),
+            longitude=float(stop.longitude),
+            label=stop.label,
+            source=stop.source,
+            matrix_index=stop.matrix_index,
+        )
+        if hasattr(cloned, "route_group") and hasattr(stop, "route_group"):
+            cloned.route_group = getattr(stop, "route_group", "")
+        return cloned
+
+    working_routes = [
+        [clone_stop(stop) for stop in route]
+        for route in routes
+    ]
+
+    def idx(stop):
+        return int(
+            stop.matrix_index
+            if stop.matrix_index is not None
+            else stop.anchor_index + 1
+        )
+
+    def directional_seconds(route):
+        if not route:
+            return 0.0, 0.0
+
+        morning_indices = [idx(stop) for stop in route]
+        morning_path = [*morning_indices, 0]
+        morning_drive = sum(
+            float(duration_matrix[a][b])
+            for a, b in zip(morning_path, morning_path[1:])
+        )
+
+        evening_indices = list(reversed(morning_indices))
+        evening_path = [0, *evening_indices]
+        evening_drive = sum(
+            float(duration_matrix[a][b])
+            for a, b in zip(evening_path, evening_path[1:])
+        )
+
+        dwell = len(route) * float(wait_seconds_per_stop)
+        return morning_drive + dwell, evening_drive + dwell
+
+    def current_walks(route):
+        values = {}
+        for stop in route:
+            for employee_index, walk in zip(
+                stop.member_indices,
+                stop.walking_distances_m,
+            ):
+                values[employee_index] = float(walk)
+        return values
+
+    total_merged = 0
+    moved_employees = 0
+    route_merge_counts = []
+
+    for route_index, original_route in enumerate(working_routes):
+        route = original_route
+        merges = 0
+
+        for _ in range(max(0, int(max_passes))):
+            if len(route) <= 1:
+                break
+
+            baseline_morning, baseline_evening = directional_seconds(route)
+            old_walk_map = current_walks(route)
+            best = None
+
+            for source_pos, source in enumerate(route):
+                for target_pos, target in enumerate(route):
+                    if source_pos == target_pos:
+                        continue
+
+                    stop_distance_m = (
+                        _local_haversine_km(
+                            (float(source.latitude), float(source.longitude)),
+                            (float(target.latitude), float(target.longitude)),
+                        )
+                        * 1000.0
+                    )
+                    if stop_distance_m > max_stop_distance_m + 1e-9:
+                        continue
+
+                    new_walks = []
+                    total_extra = 0.0
+                    largest_extra = 0.0
+                    feasible = True
+
+                    for employee_index in source.member_indices:
+                        emp = employee_coordinates[employee_index]
+                        new_walk = (
+                            _local_haversine_km(
+                                (float(target.latitude), float(target.longitude)),
+                                (float(emp[0]), float(emp[1])),
+                            )
+                            * 1000.0
+                            * walking_factor
+                        )
+                        old_walk = float(
+                            old_walk_map.get(employee_index, new_walk)
+                        )
+
+                        if old_walk > absolute_walk_cap_m:
+                            allowed_walk = old_walk
+                        else:
+                            allowed_walk = min(
+                                float(max_walk_m),
+                                float(absolute_walk_cap_m),
+                                old_walk + float(max_extra_walk_m),
+                            )
+
+                        if (
+                            new_walk > float(max_walk_m) + 1e-9
+                            or new_walk > allowed_walk + 1e-9
+                        ):
+                            feasible = False
+                            break
+
+                        extra = max(0.0, new_walk - old_walk)
+                        total_extra += extra
+                        largest_extra = max(largest_extra, extra)
+                        new_walks.append(new_walk)
+
+                    if not feasible:
+                        continue
+
+                    trial = [clone_stop(stop) for stop in route]
+                    trial_source = trial[source_pos]
+
+                    adjusted_target = (
+                        target_pos - 1
+                        if source_pos < target_pos
+                        else target_pos
+                    )
+                    del trial[source_pos]
+                    trial_target = trial[adjusted_target]
+
+                    trial_target.member_indices.extend(
+                        trial_source.member_indices
+                    )
+                    trial_target.walking_distances_m.extend(
+                        new_walks
+                    )
+
+                    pairs = sorted(
+                        zip(
+                            trial_target.member_indices,
+                            trial_target.walking_distances_m,
+                        ),
+                        key=lambda pair: (pair[1], pair[0]),
+                    )
+                    trial_target.member_indices = [
+                        pair[0] for pair in pairs
+                    ]
+                    trial_target.walking_distances_m = [
+                        pair[1] for pair in pairs
+                    ]
+
+                    trial_morning, trial_evening = directional_seconds(trial)
+
+                    # Rota süresi iki yönde de artmayacak.
+                    if trial_morning > baseline_morning + 1e-9:
+                        continue
+                    if trial_evening > baseline_evening + 1e-9:
+                        continue
+
+                    if max_route_minutes:
+                        limit = float(max_route_minutes) * 60.0
+                        if (
+                            trial_morning > limit + 1e-9
+                            or trial_evening > limit + 1e-9
+                        ):
+                            continue
+
+                    time_saved = (
+                        baseline_morning
+                        + baseline_evening
+                        - trial_morning
+                        - trial_evening
+                    )
+
+                    priority = (
+                        1 if source.source in automatic_sources else 0,
+                        1 if source.passenger_count == 1 else 0,
+                        -source.passenger_count,
+                        time_saved,
+                        -total_extra,
+                        -largest_extra,
+                        target.passenger_count,
+                    )
+
+                    if best is None or priority > best[0]:
+                        best = (
+                            priority,
+                            trial,
+                            len(source.member_indices),
+                        )
+
+            if best is None:
+                break
+
+            _, route, moved_now = best
+            merges += 1
+            total_merged += 1
+            moved_employees += moved_now
+
+        working_routes[route_index] = route
+        route_merge_counts.append(merges)
+
+    return working_routes, {
+        "merged_stop_count": total_merged,
+        "moved_employee_count": moved_employees,
+        "route_merge_counts": route_merge_counts,
+        "post_merge_stop_count": sum(
+            len(route) for route in working_routes
+        ),
+    }
 
 
 def section_header(step: str, title: str, description: str) -> None:

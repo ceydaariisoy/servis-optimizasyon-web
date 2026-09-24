@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.24-no-home-pickup-v3"
+APP_VERSION = "2026.09.24-regional-consolidation-v4"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -1474,9 +1474,10 @@ with st.sidebar:
             help=(
                 "Sistem önce yürüme sınırı içindeki mevcut/yüklenen durakları değerlendirir. "
                 "Çalışan böyle bir durağa ulaşabiliyorsa en yakın yüklenen durağa yürür. "
-                "Mevcut durağa yürüyemiyorsa güzergâh üzerinde veya güzergâha minimum "
-                "sapmayla yeni bir ortak durak adayı üretilebilir. Çalışan adresi doğrudan "
-                "servis durağı olarak kullanılmaz."
+                "Mevcut durağa yürüyemiyorsa sistem önce 2+ çalışanın kullanabileceği "
+                "ortak güzergâh noktası arar; ancak bu mümkün değilse tekil koridor/sapma "
+                "durağı açar. Rotalarda aynı bölgesel koridordaki durakların birlikte kalması "
+                "teşvik edilir. Çalışan adresi doğrudan servis durağı olarak kullanılmaz."
             ),
         )
 
@@ -1803,8 +1804,19 @@ optimized_vehicle_count = len(nonempty_routes)
 result["vehicle_count"] = optimized_vehicle_count
 avg_fill = sum(route["occupancy"] for route in nonempty_routes) / (len(nonempty_routes) * result_capacity) if nonempty_routes else 0
 total_stop_count = sum(len(route["stops"]) for route in nonempty_routes)
+automatic_stop_sources = {
+    "Otomatik ortak nokta",
+    "Güzergâh üzeri aday durak",
+    "Güzergâha yakın yeni durak",
+}
 automatic_stop_count = sum(
-    stop.get("source") in {"Otomatik ortak nokta", "Güzergâh üzeri aday durak", "Güzergâha yakın yeni durak"}
+    stop.get("source") in automatic_stop_sources
+    for route in nonempty_routes
+    for stop in route["stops"]
+)
+automatic_single_stop_count = sum(
+    stop.get("source") in automatic_stop_sources
+    and stop.get("passenger_count", 0) == 1
     for route in nonempty_routes
     for stop in route["stops"]
 )
@@ -1852,8 +1864,10 @@ with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
         t4.metric("Tekil durak", single_stop_count)
 if automatic_stop_count:
     st.caption(
-        f"{automatic_stop_count} otomatik güzergâh durağı önerildi; "
-        "kesinleştirilmeden önce saha uygunluğu kontrol edilmelidir."
+        f"{automatic_stop_count} otomatik güzergâh durağı önerildi "
+        f"({automatic_single_stop_count} tanesi tekil). "
+        "Yeni model tekil otomatik durakları ve farklı koridorlar arası gereksiz "
+        "geçişleri cezalandırır; kesinleştirilmeden önce saha uygunluğu yine kontrol edilmelidir."
     )
 if result.get("planning_mode") == "incremental":
     st.success(

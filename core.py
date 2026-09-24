@@ -5,10 +5,10 @@ Yol süreleri için önce OSRM denenir; servis erişilemezse kuş uçuşu mesafe
 tabanlı tahmine otomatik geçilir.
 
 Durak politikası:
-- Yüklenen/mevcut duraklar kesin önceliklidir.
+- Yürüme sınırı içindeki yüklenen/mevcut duraklar kesin önceliklidir; çalışan en yakınına atanır.
 - Çalışan koordinatları hiçbir zaman servis durağı olarak kullanılmaz.
-- Kapsanamayan tek çalışan için ana rota yönünde bir aday üretilir ve seçilen
-  tekil aday mümkünse OSRM ile en yakın araç yoluna oturtulur.
+- Mevcut durağa yürüyemeyen çalışan için güzergâh üzerinde veya güzergâha doğru
+  minimum sapmalı yeni bir aday üretilir; seçilen otomatik aday mümkünse OSRM ile yola oturtulur.
 """
 
 from __future__ import annotations
@@ -110,212 +110,11 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Görselde onaylanan 3 servislik referans dağılım
+# Genel durak politikası
 # ---------------------------------------------------------------------------
-
-REFERENCE_ROUTE_TEMPLATE = (
-    (
-        ("Adres tabanlı yedek durak 50", "home", ("40374",), ("40374",)),
-        ("Otomatik ortak durak 87", "midpoint", ("60882", "60083"), ("60083", "43536")),
-        ("ÇOŞTU SOKAK PALMİYE SİT. KARŞISI", "catalog", ("55665", "53656", "18253", "43536"), ()),
-        ("GÜNDÜZ ÖKÇÜN BULVARI ENTEPE KONUTLARI", "catalog", ("44550", "3823", "41031"), ()),
-        ("Adres tabanlı yedek durak 86", "home", ("61041",), ("61041",)),
-        ("AÖF ÖNÜ", "catalog", ("60706", "51071"), ()),
-        ("BÖREKÇİ (AYTAÇ CADDESİ)", "catalog", ("59124", "47969", "44327", "46865", "44549"), ()),
-        ("BAHÇELİEVLER MUHTARLIK (AYTAÇ CADDESİ)", "catalog", ("59545", "48214", "47712", "47865"), ()),
-        ("KANAL 26 ATM ÖNÜ", "catalog", ("61081", "13672", "52699"), ()),
-    ),
-    (
-        ("Otomatik ortak durak 802", "midpoint", ("61038", "49780"), ("49780", "61038")),
-        ("Adres tabanlı yedek durak 77", "home", ("55841",), ("55841",)),
-        ("MİLLİ EĞİTİM", "catalog", ("31276", "54778", "52375", "60890"), ()),
-        ("DEDEMAN OTEL", "catalog", ("43696", "56438", "54732"), ()),
-        ("ATATÜRK BULVARI BİM (AKARBAŞI TARAFI)", "catalog", ("60848", "59194"), ()),
-        ("ÖĞRETMEN EVİ", "catalog", ("43713", "57647", "26066", "37457"), ()),
-        ("SAMİ RAMAZANOĞLU CAMİ", "catalog", ("19297", "26944"), ()),
-        ("ALİ FUAT GÜVEN CAD. BEYAZIT CAMİ", "catalog", ("45768", "51971", "50131"), ()),
-        ("ALİ FUAT GÜVEN CADDESİ ERCAN SOKAK BAŞI", "catalog", ("11221", "28222", "3103"), ()),
-        ("T.M.O ÖNÜ", "catalog", ("27901", "53900", "29835"), ()),
-        ("BİRLİK CADDESİ İNCİ BÖREK", "catalog", ("26594", "15450", "54276"), ()),
-        ("UZUNLAR SK.", "catalog", ("33182", "44264", "52532", "6696"), ()),
-        ("GÜNDÜZ ÖKÇÜN BULVARI FATİH CAMİ", "catalog", ("11508", "58161", "46547"), ()),
-    ),
-    (
-        ("TOTAL PETROL", "catalog", ("43689",), ()),
-        ("Adres tabanlı yedek durak 10", "home", ("39011",), ("39011",)),
-        ("Adres tabanlı yedek durak 83", "home", ("60873",), ("60873",)),
-        ("Adres tabanlı yedek durak 52", "home", ("38932",), ("38932",)),
-        ("ALANÖNÜ NUR TAKSİ", "catalog", ("40435", "48495", "47557", "44546"), ()),
-        ("ZİYAPAŞA CAD. MİNİ TAKSİ", "catalog", ("47781",), ()),
-        ("HAT BOYU A101 ÖNÜ", "catalog", ("40002", "45778"), ()),
-        ("SAKARYA CAD. SAAT KULESİ KARAKOL", "catalog", ("48394", "50870", "52361", "41553"), ()),
-        ("ATATÜRK CADDESİ MODA TAKSİ", "catalog", ("57617", "28081", "30132"), ()),
-        ("TEPEBAŞI IŞIKLAR PETEK PASTANESİ", "catalog", ("32142", "44284", "56418", "20974"), ()),
-        ("TEPEBAŞI LUKOİL PETROL", "catalog", ("52488", "41134", "44182", "46895", "52004", "3208", "54457", "19980"), ()),
-    ),
-)
-
-
-def _reference_employee_key(value: object) -> str:
-    """Excel'deki 123 / 123.0 / '123' biçimlerini aynı sicil anahtarına çevirir."""
-    if value is None:
-        return ""
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    text = str(value).strip()
-    if re.fullmatch(r"-?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text
-
-
-def _reference_label_key(value: object) -> str:
-    """Durak adlarını Türkçe karakter ve noktalama farklarına toleranslı eşleştirir."""
-    table = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
-    text = str(value).strip().translate(table).casefold()
-    return re.sub(r"[^a-z0-9]+", "", text)
-
-
-def reference_route_employee_ids() -> set[str]:
-    return {
-        employee_id
-        for route in REFERENCE_ROUTE_TEMPLATE
-        for _, _, member_ids, _ in route
-        for employee_id in member_ids
-    }
-
-
-def build_reference_three_routes(
-    employee_ids: Sequence[object],
-    employee_coordinates: Sequence[tuple[float, float]],
-    approved_candidates: Sequence[tuple] | None,
-    max_walk_m: float = 1000.0,
-    walking_factor: float = 1.20,
-    capacity: int = 45,
-) -> list[list[CommonStop]] | None:
-    """Görselde onaylanan Rota 1–2–3 dağılımını birebir kurar.
-
-    Bu plan yalnızca çalışan kümesi referans plandaki 92 sicille birebir aynıysa
-    devreye girer. Sicil kümesi değişmişse ``None`` döner ve normal optimizasyon
-    akışı devam eder.
-
-    Durak koordinatları:
-    - mevcut duraklarda yüklenen durak kataloğundan,
-    - "Adres tabanlı yedek" duraklarda ilgili çalışanın koordinatından,
-    - otomatik ortak 87 ve 802 duraklarında eski algoritmanın ürettiği aynı
-      çalışan çiftlerinin geometrik orta noktasından alınır.
-    """
-    if len(employee_ids) != len(employee_coordinates):
-        raise ValueError("Çalışan ID ve koordinat sayıları eşleşmiyor.")
-
-    key_to_index: dict[str, int] = {}
-    for index, raw_id in enumerate(employee_ids):
-        key = _reference_employee_key(raw_id)
-        if not key or key in key_to_index:
-            return None
-        key_to_index[key] = index
-
-    expected_ids = reference_route_employee_ids()
-    if set(key_to_index) != expected_ids:
-        return None
-
-    if walking_factor < 1:
-        raise ValueError("Yürüyüş katsayısı en az 1 olmalıdır.")
-
-    catalog: dict[str, tuple[float, float, str]] = {}
-    for raw in approved_candidates or []:
-        if len(raw) < 3:
-            continue
-        try:
-            lat = float(raw[0])
-            lon = float(raw[1])
-        except (TypeError, ValueError):
-            continue
-        label = str(raw[2]).strip()
-        if label:
-            catalog[_reference_label_key(label)] = (lat, lon, label)
-
-    def employee_coord(employee_id: str) -> tuple[float, float]:
-        idx = key_to_index[employee_id]
-        lat, lon = employee_coordinates[idx]
-        return float(lat), float(lon)
-
-    def resolve_stop(
-        label: str,
-        kind: str,
-        coordinate_ids: Sequence[str],
-    ) -> tuple[float, float, str]:
-        if kind == "catalog":
-            record = catalog.get(_reference_label_key(label))
-            if record is None:
-                raise ValueError(
-                    f"Referans 3 rota için gerekli durak yüklenen durak dosyasında bulunamadı: {label}"
-                )
-            return record[0], record[1], "Yüklenen aday durak"
-
-        if kind == "home":
-            lat, lon = employee_coord(coordinate_ids[0])
-            return lat, lon, "Çalışan adresi"
-
-        if kind == "midpoint":
-            first = employee_coord(coordinate_ids[0])
-            second = employee_coord(coordinate_ids[1])
-            return (
-                (first[0] + second[0]) / 2.0,
-                (first[1] + second[1]) / 2.0,
-                "Otomatik ortak nokta",
-            )
-
-        raise ValueError(f"Bilinmeyen referans durak türü: {kind}")
-
-    routes: list[list[CommonStop]] = []
-    matrix_index = 1
-    for route_template in REFERENCE_ROUTE_TEMPLATE:
-        route: list[CommonStop] = []
-        route_load = 0
-        for stop_order, (label, kind, member_ids, coordinate_ids) in enumerate(
-            route_template, start=1
-        ):
-            latitude, longitude, source = resolve_stop(label, kind, coordinate_ids)
-            member_indices = [key_to_index[employee_id] for employee_id in member_ids]
-            walking_distances = [
-                haversine_km(
-                    (latitude, longitude),
-                    (
-                        float(employee_coordinates[member_index][0]),
-                        float(employee_coordinates[member_index][1]),
-                    ),
-                )
-                * 1000.0
-                * walking_factor
-                for member_index in member_indices
-            ]
-            if walking_distances and max(walking_distances) > max_walk_m + 0.5:
-                raise ValueError(
-                    f"Referans rota {label} durağında azami yürüme sınırı aşılıyor: "
-                    f"{max(walking_distances):.0f} m > {max_walk_m:.0f} m."
-                )
-
-            stop = CommonStop(
-                anchor_index=stop_order - 1,
-                member_indices=member_indices,
-                walking_distances_m=walking_distances,
-                latitude=latitude,
-                longitude=longitude,
-                label=label,
-                source=source,
-                matrix_index=matrix_index,
-            )
-            route.append(stop)
-            route_load += stop.passenger_count
-            matrix_index += 1
-
-        if route_load > capacity:
-            raise ValueError(
-                f"Referans rota {route_load} yolcu içeriyor; araç kapasitesi {capacity}."
-            )
-        routes.append(route)
-
-    return routes
+# Sabit 3 servis seçeneği yalnızca araç sayısını sabitler. Çalışan/durak
+# dağılımı hard-code edilmez. Çalışan koordinatı doğrudan servis durağı olarak
+# kullanılmaz; mevcut durak veya güzergâha uygun ortak adaylar değerlendirilir.
 
 
 def _interpolate_towards(
@@ -823,12 +622,17 @@ def optimize_candidate_stops(
     snap_single_stops_to_road: bool = True,
     minimum_home_offset_m: float = MIN_HOME_PICKUP_OFFSET_M,
 ) -> tuple[list[CommonStop], int, bool]:
-    """Aday durakları set-cover + hedef programlama mantığıyla seçer.
+    """Aday durakları yürüme ve durak önceliği kurallarıyla seçer.
 
-    Birinci aşama, tüm çalışanları kapsayan kesin minimum durak sayısını bulur.
-    İkinci aşama, hedef ortalama yürüyüş sağlanana kadar en fazla yürüyüş
-    iyileştirmesi sağlayan adayları ekler. Bu, minimum durak ile çalışan konforu
-    arasındaki Pareto dengesini görünür ve denetlenebilir kılar.
+    Politika:
+    - Bir çalışan yürüme sınırı içinde mevcut/yüklenen bir durağa ulaşabiliyorsa
+      otomatik yeni durak açılmaz ve çalışan erişebildiği mevcut durakların
+      en yakınına atanır.
+    - Mevcut/yüklenen durağa yürüyemeyen çalışanlarda güzergâh üzeri, ortak veya
+      güzergâha yakın otomatik adaylar değerlendirilir.
+    - Çalışan koordinatı doğrudan servis durağı olarak kullanılmaz.
+    - Birincil amaç seçilen durak sayısını azaltmak; eşit durak sayısında
+      güzergâh üzerindeki / daha az sapmalı adayları tercih etmektir.
     """
     if not employee_coordinates:
         return [], 0, True
@@ -837,11 +641,14 @@ def optimize_candidate_stops(
 
     distances_m = [
         [
-            haversine_km((candidate.latitude, candidate.longitude), employee) * 1000 * walking_factor
+            haversine_km((candidate.latitude, candidate.longitude), employee)
+            * 1000
+            * walking_factor
             for employee in employee_coordinates
         ]
         for candidate in candidates
     ]
+
     cover_by_employee = [
         [
             candidate_index
@@ -868,25 +675,57 @@ def optimize_candidate_stops(
             f"Çalışan sıraları: {displayed}{suffix}."
         )
 
-    # Yüklenen/mevcut bir durakla kapsanabilen çalışan, otomatik adaylara
-    # aktarılmaz. Otomatik güzergâh adayları yalnızca yüklenen duraklarla
-    # hiç kapsanamayan çalışanlar için devreye girer. Böylece durak türü önceliği
-    # sadece aday ayıklamada değil, asıl optimizasyon modelinde de uygulanır.
     uploaded_sources = {"Yüklenen aday durak", "Onaylı durak", "Mevcut durak"}
     eligible_by_employee: list[list[int]] = []
-    for covering in cover_by_employee:
+
+    for employee_index, covering in enumerate(cover_by_employee):
         uploaded_covering = [
             candidate_index
             for candidate_index in covering
             if candidates[candidate_index].source in uploaded_sources
         ]
-        eligible_by_employee.append(uploaded_covering or covering)
+
+        if uploaded_covering:
+            # Mevcut/yüklenen durak varsa çalışanın erişebildiği EN YAKIN durak zorunludur.
+            nearest_existing_stop = min(
+                uploaded_covering,
+                key=lambda candidate_index: (
+                    distances_m[candidate_index][employee_index],
+                    candidate_index,
+                ),
+            )
+            eligible_by_employee.append([nearest_existing_stop])
+        else:
+            # Mevcut durağa yürüyemeyen çalışan için otomatik rota-koridoru adayları serbesttir.
+            eligible_by_employee.append(list(covering))
 
     model = cp_model.CpModel()
-    selected_vars = [model.new_bool_var(f"candidate_{index}") for index in range(len(candidates))]
+    selected_vars = [
+        model.new_bool_var(f"candidate_{index}")
+        for index in range(len(candidates))
+    ]
     for covering in eligible_by_employee:
         model.add(sum(selected_vars[index] for index in covering) >= 1)
-    model.minimize(sum(selected_vars))
+
+    source_penalty = {
+        "Yüklenen aday durak": 0,
+        "Onaylı durak": 0,
+        "Mevcut durak": 0,
+        ROUTE_CORRIDOR_SOURCE: 1,
+        "Otomatik ortak nokta": 3,
+        ROUTE_DETOUR_SOURCE: 8,
+    }
+    PRIMARY_STOP_WEIGHT = 100_000
+    model.minimize(
+        sum(
+            selected_vars[index]
+            * (
+                PRIMARY_STOP_WEIGHT
+                + source_penalty.get(candidates[index].source, 20)
+            )
+            for index in range(len(candidates))
+        )
+    )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(1, time_limit_seconds)
@@ -896,7 +735,11 @@ def optimize_candidate_stops(
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise ValueError("Aday duraklar için kapsama çözümü bulunamadı.")
 
-    selected = {index for index, variable in enumerate(selected_vars) if solver.value(variable)}
+    selected = {
+        index
+        for index, variable in enumerate(selected_vars)
+        if solver.value(variable)
+    }
     minimum_stop_count = len(selected)
     minimum_proven = status == cp_model.OPTIMAL
 
@@ -905,12 +748,27 @@ def optimize_candidate_stops(
         walks: list[float] = []
         for employee_index, covering in enumerate(eligible_by_employee):
             feasible = [index for index in covering if index in selected_indices]
-            chosen = min(feasible, key=lambda index: (distances_m[index][employee_index], index))
+            if not feasible:
+                raise ValueError(
+                    f"{employee_index + 1}. çalışan için seçilen duraklar arasında uygun nokta bulunamadı."
+                )
+            chosen = min(
+                feasible,
+                key=lambda index: (
+                    distances_m[index][employee_index],
+                    source_penalty.get(candidates[index].source, 20),
+                    index,
+                ),
+            )
             assigned.append(chosen)
             walks.append(distances_m[chosen][employee_index])
         return assigned, walks
 
     assigned, walks = walking_assignment(selected)
+
+    # Ortalama yürüme hedefi yalnızca mevcut durağa erişemeyen çalışanlar için
+    # ek otomatik aday seçimini tetikleyebilir. Mevcut durağa sabitlenen kişi
+    # başka/daha uzak bir otomatik durağa taşınmaz.
     target = min(max(target_average_walk_m, 0), max_walk_m)
     while walks and sum(walks) / len(walks) > target:
         best_candidate = None
@@ -958,6 +816,7 @@ def optimize_candidate_stops(
                 source=candidate.source,
             )
         )
+
     if snap_single_stops_to_road:
         _snap_selected_automatic_stops_to_road(
             stops,
@@ -966,7 +825,9 @@ def optimize_candidate_stops(
             walking_factor,
             minimum_home_offset_m,
         )
+
     return stops, minimum_stop_count, minimum_proven
+
 
 
 def update_routes_incrementally(

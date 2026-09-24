@@ -12,7 +12,6 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
-    build_reference_three_routes,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -22,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.21-reference-3-route-exact-v1"
+APP_VERSION = "2026.09.24-no-home-pickup-v3"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -485,6 +484,155 @@ def route_number(value: object) -> int:
     return int(match.group())
 
 
+
+def _walking_distance_m(
+    first: tuple[float, float],
+    second: tuple[float, float],
+    walking_factor: float = 1.20,
+) -> float:
+    """İki koordinat arasındaki yaklaşık yürüme mesafesini metre olarak hesaplar."""
+    earth_radius_m = 6_371_008.8
+    lat1, lon1 = map(math.radians, first)
+    lat2, lon2 = map(math.radians, second)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    straight_m = 2 * earth_radius_m * math.asin(min(1.0, math.sqrt(h)))
+    return straight_m * walking_factor
+
+
+def _stop_key(latitude: float, longitude: float, label: object) -> tuple:
+    """Aynı fiziksel yüklenen durağı güvenli biçimde eşleştirmek için anahtar."""
+    return (
+        round(float(latitude), 7),
+        round(float(longitude), 7),
+        normalize(label),
+    )
+
+
+def enforce_nearest_loaded_stop_assignments(
+    stops: list[CommonStop],
+    employee_coordinates: list[tuple[float, float]],
+    approved_candidates: list[tuple],
+    max_walk_m: float,
+    walking_factor: float = 1.20,
+) -> list[CommonStop]:
+    """
+    Çalışan yürüme sınırı içinde yüklenen/mevcut bir durağa ulaşabiliyorsa
+    onu erişebildiği EN YAKIN yüklenen durağa atar.
+
+    Böylece sistem sırf durak sayısını azaltmak için çalışanı daha uzaktaki
+    mevcut durağa göndermez. Yüklenen durağa yürüyemeyen çalışanların
+    güzergâh üzeri / güzergâha yakın otomatik durak eşleşmeleri korunur.
+    """
+    loaded: list[tuple[float, float, str]] = []
+    for raw in approved_candidates or []:
+        if len(raw) < 3:
+            continue
+        try:
+            lat = float(raw[0])
+            lon = float(raw[1])
+        except (TypeError, ValueError):
+            continue
+        label = str(raw[2]).strip() or "Yüklenen aday durak"
+        loaded.append((lat, lon, label))
+
+    if not loaded:
+        return stops
+
+    nearest_loaded: dict[int, tuple[float, float, str, float]] = {}
+    for employee_index, employee_point in enumerate(employee_coordinates):
+        feasible: list[tuple[float, float, str, float]] = []
+        for lat, lon, label in loaded:
+            walk_m = _walking_distance_m(
+                (lat, lon),
+                employee_point,
+                walking_factor=walking_factor,
+            )
+            if walk_m <= max_walk_m + 1e-9:
+                feasible.append((lat, lon, label, walk_m))
+        if feasible:
+            nearest_loaded[employee_index] = min(
+                feasible,
+                key=lambda item: (item[3], normalize(item[2])),
+            )
+
+    if not nearest_loaded:
+        return stops
+
+    # Mevcut optimizasyonun bu çalışanlar için yaptığı atamaları çıkar.
+    cleaned_stops: list[CommonStop] = []
+    for stop in stops:
+        kept_pairs = [
+            (employee_index, walk_m)
+            for employee_index, walk_m in zip(
+                stop.member_indices,
+                stop.walking_distances_m,
+            )
+            if employee_index not in nearest_loaded
+        ]
+        if not kept_pairs:
+            continue
+        stop.member_indices = [pair[0] for pair in kept_pairs]
+        stop.walking_distances_m = [pair[1] for pair in kept_pairs]
+        cleaned_stops.append(stop)
+
+    # Seçili duraklar içinde zaten bulunan yüklenen durakları eşleştir.
+    stop_by_key: dict[tuple, CommonStop] = {}
+    for stop in cleaned_stops:
+        if stop.latitude is None or stop.longitude is None:
+            continue
+        if stop.source in {"Yüklenen aday durak", "Onaylı durak", "Mevcut durak"}:
+            stop_by_key[
+                _stop_key(stop.latitude, stop.longitude, stop.label)
+            ] = stop
+
+    # Her çalışanı kendi en yakın yüklenen durağına ekle.
+    for employee_index, (lat, lon, label, walk_m) in nearest_loaded.items():
+        key = _stop_key(lat, lon, label)
+        target_stop = stop_by_key.get(key)
+        if target_stop is None:
+            target_stop = CommonStop(
+                anchor_index=len(cleaned_stops),
+                member_indices=[],
+                walking_distances_m=[],
+                latitude=lat,
+                longitude=lon,
+                label=label,
+                source="Yüklenen aday durak",
+            )
+            cleaned_stops.append(target_stop)
+            stop_by_key[key] = target_stop
+
+        target_stop.member_indices.append(employee_index)
+        target_stop.walking_distances_m.append(walk_m)
+
+    # Durağın içindeki çalışanları yürüme mesafesine göre sırala.
+    for stop in cleaned_stops:
+        pairs = sorted(
+            zip(stop.member_indices, stop.walking_distances_m),
+            key=lambda pair: (pair[1], pair[0]),
+        )
+        stop.member_indices = [pair[0] for pair in pairs]
+        stop.walking_distances_m = [pair[1] for pair in pairs]
+
+    return cleaned_stops
+
+
+def is_forbidden_home_stop(label: object, source: object) -> bool:
+    """Eski sonuç dosyalarındaki ev/adres bazlı durakları yeni plana taşıma."""
+    text = normalize(f"{label} {source}")
+    forbidden_terms = (
+        "calisan_adresi",
+        "ev_adresi",
+        "adres_tabanli_yedek_durak",
+    )
+    return any(term in text for term in forbidden_terms)
+
+
 def read_previous_routes(uploaded_file, employees: pd.DataFrame) -> list[list[CommonStop]]:
     """Uygulamanın indirdiği sonuç Excel'ini artımlı plan için geri okur."""
     if uploaded_file is None:
@@ -492,7 +640,9 @@ def read_previous_routes(uploaded_file, employees: pd.DataFrame) -> list[list[Co
             "Mevcut planı koruma modu için daha önce indirdiğiniz "
             "`servis_rota_sonuclari.xlsx` dosyasını yükleyin."
         )
+
     raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else bytes(uploaded_file)
+
     try:
         stops = pd.read_excel(BytesIO(raw), sheet_name="Ortak_Duraklar").dropna(how="all")
         assignments = pd.read_excel(
@@ -506,52 +656,136 @@ def read_previous_routes(uploaded_file, employees: pd.DataFrame) -> list[list[Co
 
     required_stops = {"Rota", "Durak_Sirasi", "Durak_Adi", "Enlem", "Boylam"}
     required_assignments = {"Rota", "Durak_Sirasi", "Calisan_ID"}
-    if not required_stops.issubset(stops.columns) or not required_assignments.issubset(assignments.columns):
-        raise ValueError("Önceki rota sonuç dosyasının gerekli sayfa veya sütunları eksik.")
 
-    current_keys = [normalize_employee_id(value) for value in employees["Calisan_ID"]]
+    if (
+        not required_stops.issubset(stops.columns)
+        or not required_assignments.issubset(assignments.columns)
+    ):
+        raise ValueError(
+            "Önceki rota sonuç dosyasının gerekli sayfa veya sütunları eksik."
+        )
+
+    current_keys = [
+        normalize_employee_id(value)
+        for value in employees["Calisan_ID"]
+    ]
+
     if any(not key for key in current_keys):
-        raise ValueError("Mevcut rotayı korumak için her çalışanın sicil/ID bilgisi dolu olmalıdır.")
+        raise ValueError(
+            "Mevcut rotayı korumak için her çalışanın sicil/ID bilgisi dolu olmalıdır."
+        )
+
     if len(set(current_keys)) != len(current_keys):
-        raise ValueError("Mevcut rotayı korumak için çalışan sicil/ID değerleri benzersiz olmalıdır.")
-    employee_by_key = {key: index for index, key in enumerate(current_keys)}
+        raise ValueError(
+            "Mevcut rotayı korumak için çalışan sicil/ID değerleri benzersiz olmalıdır."
+        )
+
+    employee_by_key = {
+        key: index
+        for index, key in enumerate(current_keys)
+    }
 
     members_by_stop: dict[tuple[int, int], list[int]] = {}
+
     for _, row in assignments.iterrows():
         key = normalize_employee_id(row["Calisan_ID"])
+
         if key not in employee_by_key:
             continue
-        stop_key = (route_number(row["Rota"]), int(row["Durak_Sirasi"]))
-        members_by_stop.setdefault(stop_key, []).append(employee_by_key[key])
+
+        stop_key = (
+            route_number(row["Rota"]),
+            int(row["Durak_Sirasi"]),
+        )
+
+        members_by_stop.setdefault(
+            stop_key,
+            [],
+        ).append(
+            employee_by_key[key]
+        )
 
     route_map: dict[int, list[CommonStop]] = {}
-    ordered_stops = stops.sort_values(["Rota", "Durak_Sirasi"], kind="stable")
+
+    ordered_stops = stops.sort_values(
+        ["Rota", "Durak_Sirasi"],
+        kind="stable",
+    )
+
     for _, row in ordered_stops.iterrows():
-        lat = pd.to_numeric(row["Enlem"], errors="coerce")
-        lon = pd.to_numeric(row["Boylam"], errors="coerce")
+
+        lat = pd.to_numeric(
+            row["Enlem"],
+            errors="coerce",
+        )
+
+        lon = pd.to_numeric(
+            row["Boylam"],
+            errors="coerce",
+        )
+
         if pd.isna(lat) or pd.isna(lon):
             continue
+
         number = route_number(row["Rota"])
         order = int(row["Durak_Sirasi"])
-        members = list(dict.fromkeys(members_by_stop.get((number, order), [])))
-        route_map.setdefault(number, []).append(
+
+        label = str(
+            row["Durak_Adi"]
+        ).strip()
+
+        source = (
+            str(row["Durak_Kaynagi"]).strip()
+            if (
+                "Durak_Kaynagi" in row
+                and not pd.isna(row["Durak_Kaynagi"])
+            )
+            else "Önceki plan"
+        )
+
+        # Eski planlarda bulunan çalışan-adresi / adres tabanlı yedek
+        # durakları yeni plana taşımıyoruz.
+        if is_forbidden_home_stop(
+            label,
+            source,
+        ):
+            continue
+
+        members = list(
+            dict.fromkeys(
+                members_by_stop.get(
+                    (number, order),
+                    [],
+                )
+            )
+        )
+
+        route_map.setdefault(
+            number,
+            [],
+        ).append(
             CommonStop(
                 anchor_index=order - 1,
                 member_indices=members,
                 walking_distances_m=[0.0] * len(members),
                 latitude=float(lat),
                 longitude=float(lon),
-                label=str(row["Durak_Adi"]).strip(),
-                source=(
-                    str(row["Durak_Kaynagi"]).strip()
-                    if "Durak_Kaynagi" in row and not pd.isna(row["Durak_Kaynagi"])
-                    else "Önceki plan"
-                ),
+                label=label,
+                source=source,
             )
         )
+
     if not route_map:
-        raise ValueError("Önceki plan dosyasında geçerli rota durağı bulunamadı.")
-    return [route_map[number] for number in sorted(route_map)]
+        raise ValueError(
+            "Önceki plan dosyasında geçerli rota durağı bulunamadı."
+        )
+
+    return [
+        route_map[number]
+        for number in sorted(route_map)
+    ]
+
+
 
 
 def _format_clock(seconds_from_midnight: float) -> str:
@@ -743,91 +977,28 @@ def build_shared_routes(
     Ortak durakları ve servis rotalarını oluşturur.
 
     Temel kurallar:
+    - Çalışan adresi hiçbir zaman doğrudan servis durağı değildir.
+    - Çalışan yürüme sınırı içinde yüklenen/mevcut durağa ulaşabiliyorsa
+      erişebildiği en yakın yüklenen durağa atanır.
+    - Mevcut durağa yürüyemeyen kişi için güzergâh üzeri veya güzergâha
+      minimum sapmalı otomatik aday durak kullanılabilir.
+    - Sabit 3 servis seçeneği yalnızca araç sayısını 3'e sabitler;
+      eski adres tabanlı referans durak şablonunu kullanmaz.
     - Rota grupları sabah yönünde optimize edilir.
     - Akşam aynı çalışanlar aynı serviste kalır; yalnızca durak sırası ters çevrilir.
-    - Azami rota süresi hem sabah hem akşam için HARD constraint olarak doğrulanır.
-    - Otomatik modda sınır sağlanmıyorsa araç sayısı artırılır.
-    - OR-Tools'un boş bıraktığı araçlar sonuçtan kaldırılır; ekranda gerçek aktif rota sayısı gösterilir.
+    - Azami rota süresi hem sabah hem akşam için kontrol edilir.
     """
+
     employee_coordinates = list(
-        zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float))
+        zip(
+            employees["Enlem"].astype(float),
+            employees["Boylam"].astype(float),
+        )
     )
 
-    # Sabit 3 servis seçildiğinde ve çalışan kümesi görselde onaylanan 92 kişiyle
-    # aynı olduğunda rota/çalışan/durak dağılımını birebir referans plana sabitle.
-    if mode == "fixed":
-        reference_routes = build_reference_three_routes(
-            employee_ids=employees["Calisan_ID"].tolist(),
-            employee_coordinates=employee_coordinates,
-            approved_candidates=approved_candidates,
-            max_walk_m=max_walk_m,
-            walking_factor=1.20,
-            capacity=capacity,
-        )
-        if reference_routes is not None:
-            all_stops = [stop for route in reference_routes for stop in route]
-            route_coordinates = [
-                factory_coordinates,
-                *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
-            ]
-            # build_reference_three_routes matrix indekslerini aynı düz sırada 1..N verir.
-            duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
-                route_coordinates,
-                use_road_network=use_road_network,
-            )
-
-            morning_times, evening_times = _same_route_directional_times(
-                reference_routes, duration_matrix, wait_seconds_per_stop
-            )
-            violation = _direction_limit_violation_text(
-                morning_times, evening_times, max_route_minutes
-            )
-            if violation:
-                warnings.append(
-                    "Referans 3 rota dağılımı korunmuştur; güncel yol ağı hesabında seçilen "
-                    f"{max_route_minutes} dk sınırını aşan rota olabilir: {violation}."
-                )
-            warnings.append(
-                "Sabit 3 servis modunda görselde onaylanan Rota 1–2–3 çalışan ve durak "
-                "dağılımı birebir korunmaktadır."
-            )
-
-            output_routes = (
-                reverse_routes_for_return(reference_routes)
-                if direction == "evening"
-                else reference_routes
-            )
-            shared_routes = materialize_shared_routes(
-                output_routes,
-                duration_matrix,
-                distance_matrix,
-                direction,
-                wait_seconds_per_stop,
-            )
-            meta = {
-                "vehicle_count": 3,
-                "candidate_count": len(all_stops),
-                "minimum_stop_count": len(all_stops),
-                "minimum_proven": True,
-                "selected_stop_count": len(all_stops),
-                "route_loads": [
-                    sum(stop.passenger_count for stop in route)
-                    for route in reference_routes
-                ],
-                "load_spread": (
-                    max(sum(stop.passenger_count for stop in route) for route in reference_routes)
-                    - min(sum(stop.passenger_count for stop in route) for route in reference_routes)
-                ),
-                "matrix_source": matrix_source,
-                "warnings": warnings,
-                "planning_mode": "reference_fixed_3",
-                "same_route_morning_evening": True,
-                "hard_route_limit_minutes": max_route_minutes,
-                "max_morning_minutes": max(morning_times, default=0.0),
-                "max_evening_minutes": max(evening_times, default=0.0),
-            }
-            return shared_routes, meta
-
+    # ---------------------------------------------------------
+    # 1) ADAY DURAKLARI OLUŞTUR
+    # ---------------------------------------------------------
     candidates = generate_candidate_stops(
         employee_coordinates,
         max_walk_m=max_walk_m,
@@ -836,6 +1007,10 @@ def build_shared_routes(
         allow_automatic_candidates=allow_automatic_candidates,
         factory_coordinates=factory_coordinates,
     )
+
+    # ---------------------------------------------------------
+    # 2) ÇALIŞANLARI DURAKLARA ATA
+    # ---------------------------------------------------------
     all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
         employee_coordinates,
         candidates,
@@ -843,34 +1018,99 @@ def build_shared_routes(
         target_average_walk_m=target_average_walk_m,
         walking_factor=1.20,
     )
+
+    # Yürüme sınırı içinde yüklenen/mevcut durak bulunan çalışanlar
+    # mutlaka en yakın yüklenen durağa alınır.
+    all_stops = enforce_nearest_loaded_stop_assignments(
+        stops=all_stops,
+        employee_coordinates=employee_coordinates,
+        approved_candidates=approved_candidates,
+        max_walk_m=max_walk_m,
+        walking_factor=1.20,
+    )
+
+    if not all_stops and len(employees):
+        raise ValueError(
+            "Çalışanlar için yürüme sınırı içinde uygun servis durağı bulunamadı."
+        )
+
+    # Son güvenlik kontrolü: ev/adres tabanlı durak sonucu çıkmamalı.
+    for stop in all_stops:
+        if is_forbidden_home_stop(
+            stop.label,
+            stop.source,
+        ):
+            raise ValueError(
+                "Optimizasyon çalışan adresini servis durağı olarak üretmeye çalıştı. "
+                "Bu sistemde evden servis alımı kapalıdır."
+            )
+
+    # ---------------------------------------------------------
+    # 3) YOL MATRİSİ
+    # ---------------------------------------------------------
     route_coordinates = [
         factory_coordinates,
-        *((float(stop.latitude), float(stop.longitude)) for stop in all_stops),
+        *(
+            (float(stop.latitude), float(stop.longitude))
+            for stop in all_stops
+        ),
     ]
-    for matrix_index, stop in enumerate(all_stops, start=1):
+
+    for matrix_index, stop in enumerate(
+        all_stops,
+        start=1,
+    ):
         stop.matrix_index = matrix_index
 
-    duration_matrix, distance_matrix, matrix_source, warnings = get_travel_matrices(
+    (
+        duration_matrix,
+        distance_matrix,
+        matrix_source,
+        warnings,
+    ) = get_travel_matrices(
         route_coordinates,
         use_road_network=use_road_network,
     )
 
-    minimum_vehicle_count = math.ceil(len(employees) / capacity)
-    vehicle_count = 3 if mode == "fixed" else minimum_vehicle_count
-    if vehicle_count < minimum_vehicle_count:
-        raise ValueError(
-            f"3 araç yetersiz. Bu kapasiteyle en az {minimum_vehicle_count} araç gerekir."
-        )
-
-    # Aynı servis grubu geliş/dönüşte korunduğu için dağılım HER ZAMAN sabah yönünde çözülür.
-    planning_direction = "morning"
-    last_error: Exception | None = None
-    last_direction_violation = ""
-    maximum_vehicle_count = max(
-        vehicle_count,
-        min(len(all_stops), minimum_vehicle_count + 8),
+    # ---------------------------------------------------------
+    # 4) ARAÇ SAYISI
+    # ---------------------------------------------------------
+    minimum_vehicle_count = math.ceil(
+        len(employees) / capacity
     )
 
+    vehicle_count = (
+        3
+        if mode == "fixed"
+        else minimum_vehicle_count
+    )
+
+    if vehicle_count < minimum_vehicle_count:
+        raise ValueError(
+            f"3 araç yetersiz. Bu kapasiteyle en az "
+            f"{minimum_vehicle_count} araç gerekir."
+        )
+
+    # Aynı servis grubu geliş/dönüşte korunduğu için dağılım
+    # her zaman sabah yönünde çözülür.
+    planning_direction = "morning"
+
+    last_error: Exception | None = None
+    last_direction_violation = ""
+
+    maximum_vehicle_count = max(
+        vehicle_count,
+        min(
+            len(all_stops),
+            minimum_vehicle_count + 8,
+        ),
+    )
+
+    allocated_routes: list[list[CommonStop]] | None = None
+
+    # ---------------------------------------------------------
+    # 5) ROTA OPTİMİZASYONU
+    # ---------------------------------------------------------
     while vehicle_count <= maximum_vehicle_count:
         try:
             candidate_routes = assign_common_stops_to_routes(
@@ -885,28 +1125,48 @@ def build_shared_routes(
                 time_limit_seconds=15,
             )
 
-            # Boş araçlar servis değildir. Bunları hemen çıkarıp gerçek rota sayısını kullanıyoruz.
-            active_candidate_routes = [route for route in candidate_routes if route]
-            if not active_candidate_routes and len(employees):
-                raise ValueError("Optimizasyon aktif bir servis rotası üretemedi.")
+            active_candidate_routes = [
+                route
+                for route in candidate_routes
+                if route
+            ]
 
-            morning_times, evening_times = _same_route_directional_times(
-                active_candidate_routes,
-                duration_matrix,
-                wait_seconds_per_stop,
-            )
-            last_direction_violation = _direction_limit_violation_text(
-                morning_times, evening_times, max_route_minutes
+            if (
+                not active_candidate_routes
+                and len(employees)
+            ):
+                raise ValueError(
+                    "Optimizasyon aktif bir servis rotası üretemedi."
+                )
+
+            morning_times, evening_times = (
+                _same_route_directional_times(
+                    active_candidate_routes,
+                    duration_matrix,
+                    wait_seconds_per_stop,
+                )
             )
 
-            # OR-Tools sabah sınırını model içinde uygular. Burada ayrıca aynı rota grubunun
-            # ters akşam seferini de kontrol ediyoruz. Böylece 70 dk iki yön için de gerçek sınırdır.
-            if max_route_minutes and last_direction_violation:
+            last_direction_violation = (
+                _direction_limit_violation_text(
+                    morning_times,
+                    evening_times,
+                    max_route_minutes,
+                )
+            )
+
+            if (
+                max_route_minutes
+                and last_direction_violation
+            ):
                 if mode == "fixed":
                     raise ValueError(
-                        f"Sabit 3 servis ile {max_route_minutes} dk sınırı her iki yönde sağlanamıyor. "
-                        f"{last_direction_violation}. Rota sayısını Otomatik seçin."
+                        f"Sabit 3 servis ile {max_route_minutes} dk sınırı "
+                        "her iki yönde sağlanamıyor. "
+                        f"{last_direction_violation}. "
+                        "Rota sayısını Otomatik seçin."
                     )
+
                 vehicle_count += 1
                 continue
 
@@ -916,28 +1176,47 @@ def build_shared_routes(
 
         except ValueError as exc:
             last_error = exc
+
             if mode == "fixed":
                 raise
+
             vehicle_count += 1
-    else:
-        detail = f" Son kontrol: {last_direction_violation}." if last_direction_violation else ""
+
+    if allocated_routes is None:
+        detail = (
+            f" Son kontrol: {last_direction_violation}."
+            if last_direction_violation
+            else ""
+        )
+
         raise ValueError(
-            f"Kapasite ve {max_route_minutes} dk sabah/akşam rota süresi sınırlarını "
-            f"birlikte sağlayan çözüm bulunamadı.{detail} "
+            f"Kapasite ve {max_route_minutes} dk sabah/akşam rota süresi "
+            f"sınırlarını birlikte sağlayan çözüm bulunamadı.{detail} "
             "Araç kapasitesini veya durak yapısını kontrol edin."
         ) from last_error
 
-    # Nihai süreleri aktif sabah rota grupları üzerinden sakla.
-    morning_times, evening_times = _same_route_directional_times(
-        allocated_routes, duration_matrix, wait_seconds_per_stop
+    # ---------------------------------------------------------
+    # 6) SABAH / AKŞAM SÜRELERİ
+    # ---------------------------------------------------------
+    morning_times, evening_times = (
+        _same_route_directional_times(
+            allocated_routes,
+            duration_matrix,
+            wait_seconds_per_stop,
+        )
     )
 
-    # Kullanıcı akşam görünümünü seçerse aynı rota gruplarını ters sırada göster.
+    # ---------------------------------------------------------
+    # 7) GÖSTERİLECEK YÖN
+    # ---------------------------------------------------------
     output_routes = (
-        reverse_routes_for_return(allocated_routes)
+        reverse_routes_for_return(
+            allocated_routes
+        )
         if direction == "evening"
         else allocated_routes
     )
+
     shared_routes = materialize_shared_routes(
         output_routes,
         duration_matrix,
@@ -946,14 +1225,31 @@ def build_shared_routes(
         wait_seconds_per_stop,
     )
 
-    if any(stop.source in {"Otomatik ortak nokta", "Güzergâh üzeri aday durak", "Güzergâha yakın yeni durak"} for stop in all_stops):
+    automatic_sources = {
+        "Otomatik ortak nokta",
+        "Güzergâh üzeri aday durak",
+        "Güzergâha yakın yeni durak",
+    }
+
+    if any(
+        stop.source in automatic_sources
+        for stop in all_stops
+    ):
         warnings.append(
-            "Otomatik/adres tabanlı duraklar matematiksel adaydır; kaldırım, yaya geçidi ve "
-            "güvenli bekleme alanı sahada onaylanmalıdır."
+            "Otomatik/güzergâh adayı duraklar matematiksel adaydır; "
+            "kaldırım, yaya geçidi ve güvenli bekleme alanı sahada "
+            "onaylanmalıdır."
         )
+
     warnings.append(
-        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar "
-        "başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+        "Çalışan adresinden servis alımı yapılmaz. Çalışanlar yürüme sınırı "
+        "içindeki en yakın yüklenen/mevcut durağa; bu mümkün değilse "
+        "güzergâha uygun otomatik ortak durağa atanır."
+    )
+
+    warnings.append(
+        "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde "
+        "çalışanlar başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
     )
 
     meta = {
@@ -967,10 +1263,19 @@ def build_shared_routes(
         "planning_mode": "full",
         "same_route_morning_evening": True,
         "hard_route_limit_minutes": max_route_minutes,
-        "max_morning_minutes": max(morning_times, default=0.0),
-        "max_evening_minutes": max(evening_times, default=0.0),
+        "max_morning_minutes": max(
+            morning_times,
+            default=0.0,
+        ),
+        "max_evening_minutes": max(
+            evening_times,
+            default=0.0,
+        ),
     }
+
     return shared_routes, meta
+
+
 
 
 def build_incremental_shared_routes(
@@ -1156,8 +1461,9 @@ with st.sidebar:
         )
         if mode_label.startswith("Sabit 3"):
             st.caption(
-                "Bu seçenek mevcut 92 kişilik çalışan listesinde görsellerdeki "
-                "Rota 1–2–3 çalışan, durak ve durak sırası dağılımını birebir uygular."
+                "Bu seçenek yalnızca servis sayısını 3'te sabitler. Duraklar "
+                "mevcut/yüklenen duraklar ve güzergâha uygun otomatik adaylar "
+                "üzerinden yeniden hesaplanır; çalışan adresi doğrudan durak yapılmaz."
             )
         stop_policy_label = st.selectbox(
             "Durak politikası",
@@ -1166,9 +1472,11 @@ with st.sidebar:
                 "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Otomatik modda sistem yüklenen durakları ve güzergâh adaylarını değerlendirir. "
-                "Sabit 3 servis modunda ise görsellerdeki referans planda bulunan adres tabanlı "
-                "yedek ve otomatik ortak duraklar da aynı biçimde korunur."
+                "Sistem önce yürüme sınırı içindeki mevcut/yüklenen durakları değerlendirir. "
+                "Çalışan böyle bir durağa ulaşabiliyorsa en yakın yüklenen durağa yürür. "
+                "Mevcut durağa yürüyemiyorsa güzergâh üzerinde veya güzergâha minimum "
+                "sapmayla yeni bir ortak durak adayı üretilebilir. Çalışan adresi doğrudan "
+                "servis durağı olarak kullanılmaz."
             ),
         )
 

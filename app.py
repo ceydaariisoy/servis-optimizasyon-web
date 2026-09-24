@@ -12,6 +12,7 @@ import streamlit as st
 from core import (
     CommonStop,
     assign_common_stops_to_routes,
+    consolidate_allocated_routes,
     fetch_osrm_geometry,
     generate_candidate_stops,
     get_travel_matrices,
@@ -21,7 +22,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.24-controlled-consolidation-v6"
+APP_VERSION = "2026.09.24-stable-postmerge-v7"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -978,8 +979,9 @@ def build_shared_routes(
 
     Temel kurallar:
     - Çalışan adresi hiçbir zaman doğrudan servis durağı değildir.
-    - Çalışan yürüme sınırı içinde yüklenen/mevcut durağa ulaşabiliyorsa
-      erişebildiği en yakın yüklenen durağa atanır.
+    - Çalışan önce yürüme sınırı içindeki en yakın yüklenen/mevcut durağa atanır.
+    - Rota çözüldükten sonra yalnızca güvenli koşullarda, küçük ek yürüyüşle
+      aynı rota içindeki yakın duraklar birleştirilebilir.
     - Mevcut durağa yürüyemeyen kişi için güzergâh üzeri veya güzergâha
       minimum sapmalı otomatik aday durak kullanılabilir.
     - Sabit 3 servis seçeneği yalnızca araç sayısını 3'e sabitler;
@@ -1196,7 +1198,22 @@ def build_shared_routes(
         ) from last_error
 
     # ---------------------------------------------------------
-    # 6) SABAH / AKŞAM SÜRELERİ
+    # 6) KONTROLLÜ DURAK KONSOLİDASYONU
+    # ---------------------------------------------------------
+    # Ana OR-Tools rota dağılımını değiştirmiyoruz. Yalnızca AYNI rota içindeki
+    # yakın durakları; yürüme sınırı ve iki yönlü süre korunuyorsa birleştiriyoruz.
+    allocated_routes, consolidation_meta = consolidate_allocated_routes(
+        routes=allocated_routes,
+        employee_coordinates=employee_coordinates,
+        duration_matrix=duration_matrix,
+        max_walk_m=max_walk_m,
+        wait_seconds_per_stop=wait_seconds_per_stop,
+        max_route_minutes=max_route_minutes,
+        walking_factor=1.20,
+    )
+
+    # ---------------------------------------------------------
+    # 7) SABAH / AKŞAM SÜRELERİ
     # ---------------------------------------------------------
     morning_times, evening_times = (
         _same_route_directional_times(
@@ -1207,7 +1224,7 @@ def build_shared_routes(
     )
 
     # ---------------------------------------------------------
-    # 7) GÖSTERİLECEK YÖN
+    # 8) GÖSTERİLECEK YÖN
     # ---------------------------------------------------------
     output_routes = (
         reverse_routes_for_return(
@@ -1242,9 +1259,10 @@ def build_shared_routes(
         )
 
     warnings.append(
-        "Çalışan adresinden servis alımı yapılmaz. Çalışanlar yürüme sınırı "
-        "içindeki en yakın yüklenen/mevcut durağa; bu mümkün değilse "
-        "güzergâha uygun otomatik ortak durağa atanır."
+        "Çalışan adresinden servis alımı yapılmaz. Çalışanlar önce yürüme sınırı "
+        "içindeki en yakın yüklenen/mevcut durağa atanır; rota sonrasında yalnızca "
+        "kontrollü yakın-durak birleştirmesi uygulanabilir. Mevcut durağa yürüyemeyen "
+        "çalışanlar güzergâha uygun otomatik ortak durağa atanır."
     )
 
     warnings.append(
@@ -1252,12 +1270,23 @@ def build_shared_routes(
         "çalışanlar başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
     )
 
+    if consolidation_meta.get("merged_stop_count", 0):
+        warnings.append(
+            f"Rota dağılımı korunarak {consolidation_meta['merged_stop_count']} yakın durak "
+            "kontrollü biçimde birleştirildi. Birleştirmeler yürüme sınırını aşmadı "
+            "ve sabah/akşam rota süresini artırmadı."
+        )
+
     meta = {
         "vehicle_count": len(allocated_routes),
         "candidate_count": len(candidates),
         "minimum_stop_count": minimum_stop_count,
         "minimum_proven": minimum_proven,
-        "selected_stop_count": len(all_stops),
+        "selected_stop_count": sum(len(route) for route in allocated_routes),
+        "pre_consolidation_stop_count": len(all_stops),
+        "consolidated_stop_count": consolidation_meta.get("merged_stop_count", 0),
+        "consolidated_employee_count": consolidation_meta.get("moved_employee_count", 0),
+        "route_consolidation_counts": consolidation_meta.get("route_merge_counts", []),
         "matrix_source": matrix_source,
         "warnings": warnings,
         "planning_mode": "full",
@@ -1472,12 +1501,11 @@ with st.sidebar:
                 "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Sistem önce yürüme sınırı içindeki mevcut/yüklenen durakları değerlendirir. "
-                "Çalışan böyle bir durağa ulaşabiliyorsa en yakın yüklenen durağa yürür. "
-                "Mevcut durağa yürüyemiyorsa sistem önce 2+ çalışanın kullanabileceği "
-                "ortak güzergâh noktası arar; ancak bu mümkün değilse tekil koridor/sapma "
-                "durağı açar. Rotalarda aynı bölgesel koridordaki durakların birlikte kalması "
-                "teşvik edilir. Çalışan adresi doğrudan servis durağı olarak kullanılmaz."
+                "Sistem önce yürüme sınırı içindeki en yakın mevcut/yüklenen durağı kullanır. "
+                "Mevcut durağa yürüyemiyorsa ortak güzergâh noktası arar; gerekirse tekil "
+                "koridor/sapma durağı açar. Rota oluşturulduktan sonra aynı rota içindeki "
+                "çok yakın duraklar yalnızca küçük ek yürüyüşle ve rota süresini artırmadan "
+                "birleştirilebilir. Çalışan adresi doğrudan servis durağı olarak kullanılmaz."
             ),
         )
 
@@ -1506,6 +1534,7 @@ with st.sidebar:
             value=70,
             step=5,
             format="%d dk",
+            key="max_route_minutes_v7",
             help=(
                 "Sürüş + durak bekleme süresidir. Seçtiğiniz değer sabah ve akşam için "
                 "kontrol edilir; otomatik mod gerekirse servis sayısını artırır."
@@ -1868,6 +1897,14 @@ if automatic_stop_count:
         f"({automatic_single_stop_count} tanesi tekil). "
         "Yeni model tekil otomatik durakları ve farklı koridorlar arası gereksiz "
         "geçişleri cezalandırır; kesinleştirilmeden önce saha uygunluğu yine kontrol edilmelidir."
+    )
+
+if result.get("planning_mode") != "incremental" and result.get("consolidated_stop_count", 0):
+    before_stops = int(result.get("pre_consolidation_stop_count", total_stop_count))
+    merged_stops = int(result.get("consolidated_stop_count", 0))
+    st.success(
+        f"Kontrollü konsolidasyon: {before_stops} başlangıç durağından "
+        f"{merged_stops} durak güvenli biçimde birleştirildi; sonuç {total_stop_count} durak."
     )
 if result.get("planning_mode") == "incremental":
     st.success(

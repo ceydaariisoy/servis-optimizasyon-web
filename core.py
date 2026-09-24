@@ -5,7 +5,7 @@ Yol süreleri için önce OSRM denenir; servis erişilemezse kuş uçuşu mesafe
 tabanlı tahmine otomatik geçilir.
 
 Durak politikası:
-- Yürüme sınırı içindeki yüklenen/mevcut duraklar önceliklidir; yakın duraklar yalnızca küçük ek yürüyüşle konsolide edilebilir.
+- Yürüme sınırı içindeki yüklenen/mevcut duraklar kesin önceliklidir; çalışan en yakınına atanır.
 - Çalışan koordinatları hiçbir zaman servis durağı olarak kullanılmaz.
 - Mevcut durağa yürüyemeyen çalışan için güzergâh üzerinde veya güzergâha doğru
   minimum sapmalı yeni bir aday üretilir; seçilen otomatik aday mümkünse OSRM ile yola oturtulur.
@@ -45,17 +45,17 @@ REGIONAL_SWITCH_PENALTY_SECONDS = 420
 SINGLE_AUTOMATIC_ROUTE_PENALTY_SECONDS = 240
 DETOUR_ROUTE_PENALTY_SECONDS = 180
 BALANCE_TOLERANCE_PASSENGERS = 3
+COMFORT_EXTRA_STOP_LIMIT = 3
+COMFORT_MIN_TOTAL_IMPROVEMENT_M = 120.0
 
-# Kontrollü durak konsolidasyonu (v6):
-# En yakın mevcut durağa göre yalnızca küçük ek yürüyüş kabul edilir.
-# Böylece 500 m yerine 900 m gibi sert yönlendirmeler yapılmadan yakın duraklar birleşebilir.
-CONSOLIDATION_MAX_EXTRA_WALK_M = 120.0
-CONSOLIDATION_ABSOLUTE_WALK_CAP_M = 800.0
-
-# Konfor hedefi uğruna kapatılan durakların tekrar açılmasını sınırlıyoruz.
-COMFORT_EXTRA_STOP_LIMIT = 1
-COMFORT_MIN_TOTAL_IMPROVEMENT_M = 350.0
-COMFORT_MIN_AFFECTED_EMPLOYEES = 3
+# v7: rota çözüldükten sonra güvenli durak konsolidasyonu.
+# Ana OR-Tools dağılımı değiştirilmez; yalnızca AYNI rota içindeki yakın duraklar
+# yürüme ve süre kontrolleri sağlanıyorsa birleştirilir.
+POST_MERGE_MAX_EXTRA_WALK_M = 180.0
+POST_MERGE_ABSOLUTE_WALK_CAP_M = 900.0
+POST_MERGE_MAX_STOP_DISTANCE_M = 1400.0
+POST_MERGE_MAX_PASSES = 20
+POST_MERGE_MAX_DIRECTION_INCREASE_SECONDS = 0.0
 
 
 @dataclass
@@ -816,7 +816,7 @@ def optimize_candidate_stops(
     """Aday durakları yürüme, ortaklaştırma ve güzergâh uygunluğuna göre seçer.
 
     Politika:
-    - Mevcut/yüklenen duraklarda en yakın durak referanstır; en fazla 120 m ek yürüyüşle yakın duraklar konsolide edilebilir.
+    - Mevcut/yüklenen durağa yürüyebilen çalışan EN YAKIN mevcut durağa sabitlenir.
     - Mevcut durağı olmayan çalışanlarda 2+ kişilik ortak otomatik adaylar,
       tek kişilik yeni duraklara göre güçlü biçimde tercih edilir.
     - Ortalama yürüyüş hedefi SOFT hedeftir; yalnızca birkaç anlamlı ek durakla
@@ -879,47 +879,16 @@ def optimize_candidate_stops(
         ]
 
         if uploaded_covering:
-            # v6 kontrollü konsolidasyon:
-            # Çalışanın en yakın mevcut durağı temel referanstır. Ancak ikinci bir
-            # mevcut durak yalnızca çok küçük bir ek yürüyüş gerektiriyorsa aynı
-            # ortak durakta birleşmeye izin verilir.
-            nearest_distance = min(
-                distances_m[candidate_index][employee_index]
-                for candidate_index in uploaded_covering
+            # Kullanıcının istediği kural: sınır içindeyse EN YAKIN mevcut durağa yürü.
+            nearest_existing_stop = min(
+                uploaded_covering,
+                key=lambda candidate_index: (
+                    distances_m[candidate_index][employee_index],
+                    candidate_index,
+                ),
             )
-
-            # En yakın durak zaten 800 m'nin üzerindeyse çalışanı daha da uzağa
-            # göndermeyiz; sadece en yakın durağı uygun bırakırız.
-            if nearest_distance > CONSOLIDATION_ABSOLUTE_WALK_CAP_M:
-                allowed_limit = nearest_distance + 1e-9
-            else:
-                allowed_limit = min(
-                    max_walk_m,
-                    CONSOLIDATION_ABSOLUTE_WALK_CAP_M,
-                    nearest_distance + CONSOLIDATION_MAX_EXTRA_WALK_M,
-                )
-
-            eligible_existing = [
-                candidate_index
-                for candidate_index in uploaded_covering
-                if distances_m[candidate_index][employee_index] <= allowed_limit + 1e-9
-            ]
-
-            # Sayısal tolerans nedeniyle liste boş kalırsa en yakın durağı koru.
-            if not eligible_existing:
-                nearest_existing_stop = min(
-                    uploaded_covering,
-                    key=lambda candidate_index: (
-                        distances_m[candidate_index][employee_index],
-                        candidate_index,
-                    ),
-                )
-                eligible_existing = [nearest_existing_stop]
-
-            eligible_by_employee.append(eligible_existing)
+            eligible_by_employee.append([nearest_existing_stop])
         else:
-            # Mevcut durağa yürüyemeyen çalışanlarda otomatik güzergâh adayları
-            # kullanılabilir. Ev koordinatı yine doğrudan durak değildir.
             eligible_by_employee.append(list(covering))
 
     # Her adayın gerçekten kaç çalışanın uygun listesinde bulunduğunu hesapla.
@@ -932,12 +901,12 @@ def optimize_candidate_stops(
     ]
 
     source_penalty = {
-        "Yüklenen aday durak": 45,
-        "Onaylı durak": 45,
-        "Mevcut durak": 45,
-        ROUTE_CORRIDOR_SOURCE: 70,
-        "Otomatik ortak nokta": 35,
-        ROUTE_DETOUR_SOURCE: 150,
+        "Yüklenen aday durak": 0,
+        "Onaylı durak": 0,
+        "Mevcut durak": 0,
+        ROUTE_CORRIDOR_SOURCE: 20,
+        "Otomatik ortak nokta": 10,
+        ROUTE_DETOUR_SOURCE: 80,
     }
 
     model = cp_model.CpModel()
@@ -949,10 +918,8 @@ def optimize_candidate_stops(
     for covering in eligible_by_employee:
         model.add(sum(selected_vars[index] for index in covering) >= 1)
 
-    # Birincil amaç kesin olarak toplam durak sayısını azaltmaktır.
-    # İkincil amaçta aynı durak sayısındaki çözümler arasında daha çok çalışanın
-    # kullanabileceği ortak/mevcut duraklar tercih edilir. Böylece birbirine çok
-    # yakın iki mevcut duraktan biri, yürüyüş farkı küçükse kapanabilir.
+    # Durak sayısı hâlâ ana amaç; ancak eşit durak sayısında tek kişilik
+    # otomatik noktalar ve sapmalı noktalar belirgin biçimde pahalıdır.
     PRIMARY_STOP_WEIGHT = 1_000_000
 
     objective_terms = []
@@ -960,20 +927,16 @@ def optimize_candidate_stops(
         candidate = candidates[candidate_index]
         coverage_count = effective_coverage_count[candidate_index]
 
-        penalty = source_penalty.get(candidate.source, 180)
-
-        if candidate.source in uploaded_sources:
-            # Çok kişiyi kapsayabilen mevcut durağı eşit durak sayısında öne çıkar.
-            penalty = max(0, penalty - 9 * min(coverage_count, 5))
+        penalty = source_penalty.get(candidate.source, 100)
 
         if candidate.source in automatic_sources:
             if coverage_count <= 1:
-                # Tek kişilik yeni otomatik durak son çare olsun.
-                penalty += 420
+                penalty += 300
             elif coverage_count == 2:
-                penalty += 45
+                penalty += 30
             else:
-                penalty = max(0, penalty - 8 * min(coverage_count, 6))
+                # 3+ kişiyi birleştiren ortak adaylara küçük ödül.
+                penalty = max(0, penalty - 5 * min(coverage_count, 6))
 
         objective_terms.append(
             variable * (PRIMARY_STOP_WEIGHT + penalty)
@@ -1058,14 +1021,8 @@ def optimize_candidate_stops(
                 if candidate_index in eligible_by_employee[employee_index]
             ]
 
-            # Konsolidasyonla kapatılan bir durağı sırf küçük bir konfor kazancı
-            # için tekrar açmayalım. Ek durak ancak en az 3 çalışanı anlamlı
-            # biçimde etkiliyorsa değerlendirilsin.
-            if len(eligible_employees) < COMFORT_MIN_AFFECTED_EMPLOYEES:
-                continue
-
-            # Tek kişilik otomatik adaylar hiçbir durumda yalnızca konfor hedefi
-            # için ek durak haline gelmez.
+            # Tek kişilik otomatik adaylar sadece yürüyüş ortalamasını düşürmek
+            # için ek durak haline gelmesin.
             if (
                 candidate.source in automatic_sources
                 and len(eligible_employees) <= 1
@@ -1714,6 +1671,261 @@ def parse_kml_points(file_bytes: bytes, filename: str = "harita.kml") -> list[di
         raise ValueError("KML/KMZ dosyasında koordinatlı nokta bulunamadı.")
     return points
 
+
+
+
+def consolidate_allocated_routes(
+    routes: Sequence[Sequence[CommonStop]],
+    employee_coordinates: Sequence[tuple[float, float]],
+    duration_matrix: Sequence[Sequence[float]],
+    max_walk_m: float,
+    wait_seconds_per_stop: int,
+    max_route_minutes: float = 0,
+    walking_factor: float = 1.20,
+    max_extra_walk_m: float = POST_MERGE_MAX_EXTRA_WALK_M,
+    absolute_walk_cap_m: float = POST_MERGE_ABSOLUTE_WALK_CAP_M,
+    max_stop_distance_m: float = POST_MERGE_MAX_STOP_DISTANCE_M,
+    max_passes: int = POST_MERGE_MAX_PASSES,
+) -> tuple[list[list[CommonStop]], dict]:
+    """Aynı rota içindeki yakın durakları kontrollü biçimde birleştirir.
+
+    Ana rota optimizasyonu değiştirilmez. Yalnızca aynı araçta bulunan iki durak,
+    çalışan yürüyüşü ve iki yönlü rota süresi bozulmuyorsa tek durakta birleştirilir.
+    """
+
+    def clone_stop(stop: CommonStop) -> CommonStop:
+        return CommonStop(
+            anchor_index=stop.anchor_index,
+            member_indices=list(stop.member_indices),
+            walking_distances_m=list(stop.walking_distances_m),
+            latitude=float(stop.latitude),
+            longitude=float(stop.longitude),
+            label=stop.label,
+            source=stop.source,
+            matrix_index=stop.matrix_index,
+            route_group=getattr(stop, "route_group", ""),
+        )
+
+    working_routes = [
+        [clone_stop(stop) for stop in route]
+        for route in routes
+    ]
+
+    def matrix_index(stop: CommonStop) -> int:
+        return int(
+            stop.matrix_index
+            if stop.matrix_index is not None
+            else stop.anchor_index + 1
+        )
+
+    def directional_seconds(route: Sequence[CommonStop]) -> tuple[float, float]:
+        if not route:
+            return 0.0, 0.0
+
+        morning_indices = [matrix_index(stop) for stop in route]
+        morning_path = [*morning_indices, 0]
+        morning_drive = sum(
+            float(duration_matrix[a][b])
+            for a, b in zip(morning_path, morning_path[1:])
+        )
+
+        evening_indices = list(reversed(morning_indices))
+        evening_path = [0, *evening_indices]
+        evening_drive = sum(
+            float(duration_matrix[a][b])
+            for a, b in zip(evening_path, evening_path[1:])
+        )
+
+        service_seconds = len(route) * float(wait_seconds_per_stop)
+        return (
+            morning_drive + service_seconds,
+            evening_drive + service_seconds,
+        )
+
+    def current_walk_map(route: Sequence[CommonStop]) -> dict[int, float]:
+        result: dict[int, float] = {}
+        for stop in route:
+            for employee_index, walk_m in zip(
+                stop.member_indices,
+                stop.walking_distances_m,
+            ):
+                result[employee_index] = float(walk_m)
+        return result
+
+    def source_is_automatic(stop: CommonStop) -> bool:
+        return stop.source in {
+            ROUTE_CORRIDOR_SOURCE,
+            ROUTE_DETOUR_SOURCE,
+            "Otomatik ortak nokta",
+        }
+
+    total_merged_stops = 0
+    moved_employee_count = 0
+    route_merge_counts: list[int] = []
+
+    for route_index, original_route in enumerate(working_routes):
+        route = original_route
+        route_merges = 0
+
+        for _ in range(max(0, int(max_passes))):
+            if len(route) <= 1:
+                break
+
+            baseline_morning, baseline_evening = directional_seconds(route)
+            current_walks = current_walk_map(route)
+            best_choice = None
+
+            for source_pos, source in enumerate(route):
+                for target_pos, target in enumerate(route):
+                    if source_pos == target_pos:
+                        continue
+
+                    stop_distance_m = (
+                        haversine_km(
+                            (float(source.latitude), float(source.longitude)),
+                            (float(target.latitude), float(target.longitude)),
+                        )
+                        * 1000.0
+                    )
+                    if stop_distance_m > max_stop_distance_m + 1e-9:
+                        continue
+
+                    new_source_walks: list[float] = []
+                    feasible = True
+                    total_extra_walk = 0.0
+                    largest_extra_walk = 0.0
+
+                    for employee_index in source.member_indices:
+                        employee_point = employee_coordinates[employee_index]
+                        new_walk = _estimated_walk_m(
+                            (float(target.latitude), float(target.longitude)),
+                            employee_point,
+                            walking_factor,
+                        )
+                        current_walk = float(
+                            current_walks.get(employee_index, new_walk)
+                        )
+
+                        # 900 m üzerindeki mevcut yürüyüşü daha da kötüleştirme.
+                        # 900 m altındaysa en fazla +180 m ek yürüyüşe izin ver.
+                        if current_walk > absolute_walk_cap_m:
+                            allowed_walk = current_walk
+                        else:
+                            allowed_walk = min(
+                                float(max_walk_m),
+                                float(absolute_walk_cap_m),
+                                current_walk + float(max_extra_walk_m),
+                            )
+
+                        if new_walk > float(max_walk_m) + 1e-9:
+                            feasible = False
+                            break
+                        if new_walk > allowed_walk + 1e-9:
+                            feasible = False
+                            break
+
+                        extra = max(0.0, new_walk - current_walk)
+                        total_extra_walk += extra
+                        largest_extra_walk = max(largest_extra_walk, extra)
+                        new_source_walks.append(new_walk)
+
+                    if not feasible:
+                        continue
+
+                    trial_route = [clone_stop(stop) for stop in route]
+                    trial_source = trial_route[source_pos]
+
+                    # Kaynak silindikten sonra hedef indeksini düzelt.
+                    adjusted_target_pos = target_pos - 1 if source_pos < target_pos else target_pos
+                    del trial_route[source_pos]
+                    trial_target = trial_route[adjusted_target_pos]
+
+                    trial_target.member_indices.extend(trial_source.member_indices)
+                    trial_target.walking_distances_m.extend(new_source_walks)
+
+                    pairs = sorted(
+                        zip(
+                            trial_target.member_indices,
+                            trial_target.walking_distances_m,
+                        ),
+                        key=lambda pair: (pair[1], pair[0]),
+                    )
+                    trial_target.member_indices = [pair[0] for pair in pairs]
+                    trial_target.walking_distances_m = [pair[1] for pair in pairs]
+
+                    trial_morning, trial_evening = directional_seconds(trial_route)
+
+                    # İyi çalışan ana rota yapısını bozma: iki yönde de süre artışı yok.
+                    if (
+                        trial_morning
+                        > baseline_morning
+                        + POST_MERGE_MAX_DIRECTION_INCREASE_SECONDS
+                        + 1e-9
+                    ):
+                        continue
+                    if (
+                        trial_evening
+                        > baseline_evening
+                        + POST_MERGE_MAX_DIRECTION_INCREASE_SECONDS
+                        + 1e-9
+                    ):
+                        continue
+
+                    if max_route_minutes:
+                        hard_limit_seconds = float(max_route_minutes) * 60.0
+                        if trial_morning > hard_limit_seconds + 1e-9:
+                            continue
+                        if trial_evening > hard_limit_seconds + 1e-9:
+                            continue
+
+                    time_saved = (
+                        baseline_morning
+                        + baseline_evening
+                        - trial_morning
+                        - trial_evening
+                    )
+
+                    # Öncelik:
+                    # - otomatik/tekil durağı kaldır,
+                    # - az yolculu durağı kaldır,
+                    # - iki yönde daha çok süre kazan,
+                    # - daha az ek yürüyüş yarat.
+                    priority = (
+                        1 if source_is_automatic(source) else 0,
+                        1 if source.passenger_count == 1 else 0,
+                        -source.passenger_count,
+                        time_saved,
+                        -total_extra_walk,
+                        -largest_extra_walk,
+                        target.passenger_count,
+                        -source_pos,
+                        -target_pos,
+                    )
+
+                    if best_choice is None or priority > best_choice[0]:
+                        best_choice = (
+                            priority,
+                            trial_route,
+                            len(source.member_indices),
+                        )
+
+            if best_choice is None:
+                break
+
+            _, route, moved_now = best_choice
+            route_merges += 1
+            total_merged_stops += 1
+            moved_employee_count += moved_now
+
+        working_routes[route_index] = route
+        route_merge_counts.append(route_merges)
+
+    return working_routes, {
+        "merged_stop_count": total_merged_stops,
+        "moved_employee_count": moved_employee_count,
+        "route_merge_counts": route_merge_counts,
+        "post_merge_stop_count": sum(len(route) for route in working_routes),
+    }
 
 
 def reverse_routes_for_return(routes: Sequence[Sequence[CommonStop]]) -> list[list[CommonStop]]:

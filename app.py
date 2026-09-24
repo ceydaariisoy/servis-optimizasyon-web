@@ -21,7 +21,7 @@ from core import (
 )
 
 
-APP_VERSION = "2026.09.24-stable-postmerge-v7.1"
+APP_VERSION = "2026.09.24-final-stable-v8"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -552,6 +552,87 @@ def consolidate_allocated_routes(
             len(route) for route in working_routes
         ),
     }
+
+
+
+AUTOMATIC_STOP_SOURCES = {
+    "Otomatik ortak nokta",
+    "Güzergâh üzeri aday durak",
+    "Güzergâha yakın yeni durak",
+}
+
+
+def professional_stop_name(stop: dict, route_no: int, order: int) -> str:
+    """Durak adını kullanıcıya daha kurumsal ve anlaşılır biçimde gösterir.
+
+    Optimizasyonda kullanılan gerçek label değiştirilmez. Bu fonksiyon yalnızca
+    ekran, harita ve rapor çıktısında sunulan adı düzenler.
+    """
+    raw = str(stop.get("label", "") or "").strip()
+    source = str(stop.get("source", "") or "").strip()
+
+    if source not in AUTOMATIC_STOP_SOURCES:
+        return raw
+
+    # Eski koridor adlarını kullanıcıya göstermemek için baştaki
+    # "VitrA Karo 1/2/3" ifadesini temizle.
+    cleaned = re.sub(
+        r"^\s*VitrA\s*Karo\s*\d+\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Yol/sokak adı OSRM'den geldiyse onu koru.
+    road_name = re.sub(
+        r"\s*(güzergâha yakın yeni durak|güzergâh üzeri aday durak|"
+        r"ortak güzergâh adayı(?:\s*çift)?|güzergâh adayı)\s*\d*\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" -–")
+
+    generic_tokens = {
+        "",
+        "ortak",
+        "yeni durak",
+        "aday durak",
+    }
+    has_meaningful_road_name = road_name.casefold() not in generic_tokens
+
+    if source == "Otomatik ortak nokta":
+        if has_meaningful_road_name:
+            return f"{road_name} – Önerilen Ortak Durak"
+        return f"Önerilen Ortak Durak R{route_no}-{order}"
+
+    if source == "Güzergâh üzeri aday durak":
+        if has_meaningful_road_name:
+            return f"{road_name} – Önerilen Güzergâh Durağı"
+        return f"Önerilen Güzergâh Durağı R{route_no}-{order}"
+
+    if source == "Güzergâha yakın yeni durak":
+        if has_meaningful_road_name:
+            return f"{road_name} – Önerilen Yeni Durak"
+        return f"Önerilen Yeni Durak R{route_no}-{order}"
+
+    return raw
+
+
+def professional_stop_source(source: object) -> str:
+    source = str(source or "").strip()
+    mapping = {
+        "Yüklenen aday durak": "Mevcut / Yüklenen Durak",
+        "Onaylı durak": "Mevcut / Onaylı Durak",
+        "Mevcut durak": "Mevcut Durak",
+        "Otomatik ortak nokta": "Yeni Ortak Durak Önerisi",
+        "Güzergâh üzeri aday durak": "Yeni Güzergâh Durağı Önerisi",
+        "Güzergâha yakın yeni durak": "Yeni Güzergâh Durağı Önerisi",
+    }
+    return mapping.get(source, source)
+
+
+def stop_field_check(source: object) -> str:
+    return "Gerekli" if str(source or "").strip() in AUTOMATIC_STOP_SOURCES else "-"
 
 
 def section_header(step: str, title: str, description: str) -> None:
@@ -1671,8 +1752,9 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                     "Rota": f"Rota {route['vehicle_no']}",
                     "Durak_Sirasi": order,
                     "Tahmini_Saat": stop.get("scheduled_time", ""),
-                    "Durak_Adi": stop["label"],
-                    "Durak_Kaynagi": stop["source"],
+                    "Durak_Adi": professional_stop_name(stop, route["vehicle_no"], order),
+                    "Durak_Kaynagi": professional_stop_source(stop["source"]),
+                    "Saha_Kontrolu": stop_field_check(stop["source"]),
                     "Durak_Turu": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
                     "Yolcu_Sayisi": stop["passenger_count"],
                     "Enlem": stop["latitude"],
@@ -1690,8 +1772,9 @@ def result_workbook(shared_routes, employees: pd.DataFrame, capacity: int) -> by
                         "Calisan_ID": row["Calisan_ID"],
                         "Ad_Soyad": row["Ad_Soyad"],
                         "Ev_Adresi": row["Adres"],
-                        "Durak_Adi": stop["label"],
-                        "Durak_Kaynagi": stop["source"],
+                        "Durak_Adi": professional_stop_name(stop, route["vehicle_no"], order),
+                        "Durak_Kaynagi": professional_stop_source(stop["source"]),
+                        "Saha_Kontrolu": stop_field_check(stop["source"]),
                         "Yurume_Mesafesi_m": round(stop["walk_by_employee"][employee_index]),
                         "Durak_Enlem": stop["latitude"],
                         "Durak_Boylam": stop["longitude"],
@@ -1794,7 +1877,7 @@ with st.sidebar:
             value=70,
             step=5,
             format="%d dk",
-            key="max_route_minutes_v7",
+            key="max_route_minutes_v8",
             help=(
                 "Sürüş + durak bekleme süresidir. Seçtiğiniz değer sabah ve akşam için "
                 "kontrol edilir; otomatik mod gerekirse servis sayısını artırır."
@@ -1814,6 +1897,11 @@ with st.sidebar:
             "🔒 Aynı çalışanlar geliş ve dönüşte aynı servis rotasında kalır. "
             f"Sistem seçtiğiniz {max_route_minutes} dk sınırını hem sabah hem akşam için kontrol eder."
         )
+        if max_route_minutes > 70:
+            st.warning(
+                "Operasyonel hedef 70 dk olarak belirlendi. Daha yüksek bir sınır seçildiğinde "
+                "sistem 70 dk üzerindeki çözümleri de kabul edebilir."
+            )
         use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
         road_consent = False
         if use_road_network:
@@ -2136,6 +2224,17 @@ s2.metric("En uzun yürüme", f"{maximum_walk:.0f} m")
 s3.metric("Toplam rota mesafesi", f"{total_distance:.1f} km")
 s4.metric("En uzun rota", f"{longest_route:.0f} dk")
 
+if longest_route <= 70 + 1e-9 and maximum_walk <= result_max_walk_m + 1e-9:
+    st.success(
+        f"Operasyonel kontrol uygun: en uzun rota {longest_route:.0f} dk, "
+        f"en uzun yürüme {maximum_walk:.0f} m. "
+        "Yeni/otomatik duraklar saha kontrolünden sonra kesinleştirilmelidir."
+    )
+elif longest_route > 70 + 1e-9:
+    st.warning(
+        f"En uzun rota {longest_route:.0f} dk. Operasyonel 70 dk hedefinin üzerindedir."
+    )
+
 with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
     t1, t2, t3, t4 = st.columns(4)
     if result.get("planning_mode") == "incremental":
@@ -2215,14 +2314,20 @@ for route in nonempty_routes:
             stop = stop_by_matrix_index[matrix_index]
             ordered_coordinates.append((stop["latitude"], stop["longitude"]))
             stop_type = "Ortak" if stop["passenger_count"] > 1 else "Tekil"
+            stop_order = stop_number_by_index[matrix_index]
+            display_name = professional_stop_name(
+                stop,
+                route["vehicle_no"],
+                stop_order,
+            )
             point_data.append(
                 {
                     "lon": stop["longitude"], "lat": stop["latitude"],
                     "label": (
-                        f"Rota {route['vehicle_no']} · {stop_type} Durak {stop_number_by_index[matrix_index]} · "
-                        f"{stop['passenger_count']} yolcu · {stop['label']}"
+                        f"Rota {route['vehicle_no']} · {stop_type} Durak {stop_order} · "
+                        f"{stop['passenger_count']} yolcu · {display_name}"
                     ),
-                    "stop_no": str(stop_number_by_index[matrix_index]),
+                    "stop_no": str(stop_order),
                     "color": color,
                     "radius": 95 + stop["passenger_count"] * 10,
                 }
@@ -2307,6 +2412,7 @@ for route in nonempty_routes:
                 "Konum": factory_address,
                 "Yolcu": None,
                 "En Uzak Yürüme": "-",
+                "Saha Kontrolü": "-",
                 "Bu Durağa Gelecekler": "-",
             }
         )
@@ -2320,10 +2426,15 @@ for route in nonempty_routes:
                 "Durak": str(order),
                 "Tahmini Saat": stop.get("scheduled_time", ""),
                 "Durak Türü": "Ortak" if stop["passenger_count"] > 1 else "Tekil",
-                "Kaynak": stop["source"],
-                "Konum": stop["label"],
+                "Kaynak": professional_stop_source(stop["source"]),
+                "Konum": professional_stop_name(
+                    stop,
+                    route["vehicle_no"],
+                    order,
+                ),
                 "Yolcu": stop["passenger_count"],
                 "En Uzak Yürüme": f"{stop['max_walk_m']:.0f} m",
+                "Saha Kontrolü": stop_field_check(stop["source"]),
                 "Bu Durağa Gelecekler": passenger_names,
             }
         )
@@ -2337,6 +2448,7 @@ for route in nonempty_routes:
                 "Konum": factory_address,
                 "Yolcu": None,
                 "En Uzak Yürüme": "-",
+                "Saha Kontrolü": "-",
                 "Bu Durağa Gelecekler": "-",
             }
         )

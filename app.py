@@ -16,12 +16,12 @@ from core import (
     generate_candidate_stops,
     get_travel_matrices,
     optimize_candidate_stops,
-    reverse_routes_for_return,
+    optimize_routes_for_direction,
     update_routes_incrementally,
 )
 
 
-APP_VERSION = "2026.09.24-final-stable-v8"
+APP_VERSION = "2026.10.08-v9.1-evening-order-optimization"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -1268,22 +1268,37 @@ def _same_route_directional_times(
     duration_matrix: list[list[float]],
     wait_seconds_per_stop: int,
 ) -> tuple[list[float], list[float]]:
-    """Aynı çalışan/araç grubu için sabah ve ters akşam sürelerini birlikte hesaplar."""
+    """Aynı çalışan/araç ve durak grubu için iki yönün optimize edilmiş sürelerini hesaplar."""
     morning_times = []
     evening_times = []
-    for route in morning_routes:
-        if not route:
+
+    evening_routes = optimize_routes_for_direction(
+        morning_routes,
+        duration_matrix,
+        direction="evening",
+    )
+
+    for morning_route, evening_route in zip(morning_routes, evening_routes):
+        if not morning_route:
             continue
+
         morning_times.append(
             _allocated_route_total_minutes(
-                route, duration_matrix, "morning", wait_seconds_per_stop
+                morning_route,
+                duration_matrix,
+                "morning",
+                wait_seconds_per_stop,
             )
         )
         evening_times.append(
             _allocated_route_total_minutes(
-                list(reversed(route)), duration_matrix, "evening", wait_seconds_per_stop
+                evening_route,
+                duration_matrix,
+                "evening",
+                wait_seconds_per_stop,
             )
         )
+
     return morning_times, evening_times
 
 
@@ -1568,8 +1583,10 @@ def build_shared_routes(
     # 8) GÖSTERİLECEK YÖN
     # ---------------------------------------------------------
     output_routes = (
-        reverse_routes_for_return(
-            allocated_routes
+        optimize_routes_for_direction(
+            allocated_routes,
+            duration_matrix,
+            direction="evening",
         )
         if direction == "evening"
         else allocated_routes
@@ -1608,7 +1625,8 @@ def build_shared_routes(
 
     warnings.append(
         "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde "
-        "çalışanlar başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+        "çalışanlar başka bir rotaya aktarılmaz; aynı duraklar korunur ve durak sırası "
+        "akşam yönü için ayrıca optimize edilir."
     )
 
     if consolidation_meta.get("merged_stop_count", 0):
@@ -1699,7 +1717,11 @@ def build_incremental_shared_routes(
         )
 
     output_routes = (
-        reverse_routes_for_return(allocated_routes)
+        optimize_routes_for_direction(
+            allocated_routes,
+            duration_matrix,
+            direction="evening",
+        )
         if direction == "evening"
         else allocated_routes
     )
@@ -1718,7 +1740,8 @@ def build_incremental_shared_routes(
     meta["max_evening_minutes"] = max(evening_times, default=0.0)
     meta.setdefault("warnings", []).append(
         "Geliş ve dönüş aynı servis rotasına sabitlenmiştir. Akşam seferinde çalışanlar "
-        "başka bir rotaya aktarılmaz; durak sırası sabah rotasının tersidir."
+        "başka bir rotaya aktarılmaz; aynı duraklar korunur ve durak sırası "
+        "akşam yönü için ayrıca optimize edilir."
     )
     return shared_routes, meta
 

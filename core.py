@@ -1929,8 +1929,62 @@ def consolidate_allocated_routes(
 
 
 def reverse_routes_for_return(routes: Sequence[Sequence[CommonStop]]) -> list[list[CommonStop]]:
-    """Sabah rota gruplarını koruyup akşam için durak sırasını tersine çevirir."""
+    """Geriye dönük uyumluluk için sabah sırasını tersine çevirir."""
     return [list(reversed(route)) for route in routes]
+
+
+def optimize_routes_for_direction(
+    routes: Sequence[Sequence[CommonStop]],
+    duration_matrix: Sequence[Sequence[float]],
+    direction: str,
+) -> list[list[CommonStop]]:
+    """Rota üyeliğini ve durak atamalarını koruyup yalnızca ziyaret sırasını optimize eder.
+
+    Aynı çalışanlar aynı araçta ve aynı durakta kalır. Sabah/akşam yönüne göre
+    nearest-neighbor + 2-opt ile rota içi durak sırası yeniden hesaplanır.
+    """
+    if direction not in {"morning", "evening"}:
+        raise ValueError("Yön 'morning' veya 'evening' olmalıdır.")
+
+    optimized_routes: list[list[CommonStop]] = []
+
+    for raw_route in routes:
+        route = list(raw_route)
+        if len(route) <= 1:
+            optimized_routes.append(route)
+            continue
+
+        matrix_indices = [
+            int(
+                stop.matrix_index
+                if stop.matrix_index is not None
+                else stop.anchor_index + 1
+            )
+            for stop in route
+        ]
+
+        ordered_indices = order_route_points(
+            matrix_indices,
+            duration_matrix,
+            direction=direction,
+        )
+
+        by_matrix_index: dict[int, list[CommonStop]] = {}
+        for matrix_index, stop in zip(matrix_indices, route):
+            by_matrix_index.setdefault(matrix_index, []).append(stop)
+
+        ordered_route: list[CommonStop] = []
+        for matrix_index in ordered_indices:
+            bucket = by_matrix_index.get(int(matrix_index), [])
+            if not bucket:
+                raise ValueError(
+                    "Rota sıralaması yeniden oluşturulurken durak eşleşmesi bulunamadı."
+                )
+            ordered_route.append(bucket.pop(0))
+
+        optimized_routes.append(ordered_route)
+
+    return optimized_routes
 
 
 def _route_path(employee_indices: Sequence[int], direction: str) -> list[int]:
